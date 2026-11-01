@@ -1,0 +1,63 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.nocturne.archive'
+
+    // Launcher artwork is maintained in the project-level /icon folder.
+    sourceSets {
+        main {
+            res.srcDirs += "${rootProject.projectDir}/icon/res"
+        }
+    }
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.nocturne.archive'
+        minSdk 24
+        targetSdk 35
+        versionCode 410
+        versionName '4.1.0'
+
+        // Current Android phones and common x86_64 emulators.
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources {
+            excludes += ['/META-INF/DEPENDENCIES', '/META-INF/LICENSE*', '/META-INF/NOTICE*']
+        }
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = '3.11'
+        pip {
+            install 'Flask==3.1.2'
+            install 'requests==2.32.5'
+            install 'beautifulsoup4==4.14.2'
+            install 'urllib3==2.5.0'
+        }
+    }
+}

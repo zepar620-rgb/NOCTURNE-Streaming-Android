@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 560" role="img" aria-label="NOCTURNE custom charcoal anime archive banner">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#26292f"/>
+      <stop offset=".52" stop-color="#17191e"/>
+      <stop offset="1" stop-color="#0c0e11"/>
+    </linearGradient>
+    <linearGradient id="red" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#bd526e" stop-opacity=".8"/>
+      <stop offset="1" stop-color="#70273c" stop-opacity=".12"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#9e304c" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#9e304c" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grain" width="26" height="26" patternUnits="userSpaceOnUse">
+      <path d="M0 13h26M13 0v26" stroke="#fff" stroke-opacity=".025" stroke-width="1"/>
+      <circle cx="4" cy="5" r=".8" fill="#fff" fill-opacity=".12"/>
+      <circle cx="20" cy="19" r=".7" fill="#fff" fill-opacity=".08"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="560" fill="url(#bg)"/>
+  <ellipse cx="1240" cy="255" rx="500" ry="340" fill="url(#glow)"/>
+  <path d="M0 450 520 190 890 560H0Z" fill="#34373e" opacity=".19"/>
+  <path d="M640 0 1020 0 1480 560H1220Z" fill="#fff" opacity=".018"/>
+  <g fill="none" stroke="url(#red)" stroke-width="2">
+    <path d="M920 530 1300 150 1570 420"/>
+    <path d="M1010 560 1390 180 1590 380" opacity=".55"/>
+    <path d="M1100 560 1480 180" opacity=".35"/>
+  </g>
+  <g transform="translate(1270 280)" fill="none">
+    <circle r="210" stroke="#a84962" stroke-opacity=".32" stroke-width="1.5"/>
+    <circle r="176" stroke="#d1c8ca" stroke-opacity=".14" stroke-width="1" stroke-dasharray="3 13"/>
+    <path d="M0-156 156 0 0 156-156 0Z" stroke="#b34863" stroke-opacity=".6" stroke-width="2"/>
+    <path d="M0-112 112 0 0 112-112 0Z" stroke="#eee8e9" stroke-opacity=".2"/>
+    <path d="M0-74 22-18 78 0 22 18 0 74-22 18-78 0-22-18Z" fill="#a83d59" fill-opacity=".23" stroke="#d47a91" stroke-opacity=".5"/>
+    <path d="M0-48V48M-48 0H48" stroke="#e1d8dc" stroke-opacity=".55" stroke-width="3"/>
+  </g>
+  <g fill="#d8d9dc" opacity=".32">
+    <circle cx="1030" cy="95" r="2"/><circle cx="1110" cy="445" r="3"/><circle cx="1490" cy="95" r="2"/>
+    <circle cx="920" cy="315" r="1.5"/><circle cx="1515" cy="480" r="2.5"/><circle cx="1190" cy="75" r="1.5"/>
+  </g>
+  <rect width="1600" height="560" fill="url(#grain)"/>
+  <path d="M0 1H1600" stroke="#d1cbd0" stroke-opacity=".12"/>
+  <path d="M0 559H1600" stroke="#a84962" stroke-opacity=".35"/>
+</svg>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="NocturneTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">serif</item>
+        <item name="android:colorAccent">#B52E53</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">#101113</item>
+        <item name="android:navigationBarColor">#08090B</item>
+        <item name="android:windowBackground">#101113</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>
