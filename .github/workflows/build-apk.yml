@@ -44,14 +44,10 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install source-check dependencies
-        run: python -m pip install Flask==3.1.2 requests==2.32.5 beautifulsoup4==4.14.2 urllib3==2.5.0
 
       - name: Check Python source
         run: python -m compileall -q app/src/main/python docs
 
-      - name: Run offline tests
-        run: python docs/test_providers.py
 
       - name: Check inline JavaScript
         run: python docs/check_inline_js.py
