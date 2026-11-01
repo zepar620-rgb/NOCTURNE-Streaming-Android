@@ -14,3 +14,11 @@ Kitsu and AniPub integrations have been removed from the search, discovery,
 detail, and provider-monitor flows. The remaining services are independent
 third parties; their availability, terms, schemas and rate limits can change.
 Check the provider's current documentation before redistributing the app.
+
+
+## Anime wallpapers
+
+- Komorebi public wallpaper API: https://github.com/amooo-ooo/komorebi
+- Safe JSON endpoint used by NOCTURNE: `GET https://komorebi.orizuru.dev/image?rating=safe&format=json`
+- The app proxies requests through `/api/wallpapers` to avoid relying on browser CORS. It validates HTTPS image URLs, requests only `rating=safe`, and shows provider errors instead of fake placeholder results.
+- Provider availability is external and can change. Verify the live endpoint before release; no Waifu.im endpoint is used.

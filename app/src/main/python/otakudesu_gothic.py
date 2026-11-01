@@ -1106,6 +1106,82 @@ def api_health():
     return jsonify({"ok": True, "site": BASE_URL, "app": "NOCTURNE: streaming anime", "mal_provider": urlparse(MAL_API_BASE).hostname, "anilist_enabled": ANILIST_ENABLED})
 
 
+# Public, keyless anime-wallpaper catalogue. The provider documents a safe-only
+# JSON endpoint; requests are proxied server-side to avoid browser CORS issues.
+WALLPAPER_API_HOSTS = ("komorebi.orizuru.dev", "owo.orizuru.dev")
+_wallpaper_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_wallpaper_cache_lock = threading.Lock()
+
+
+def fetch_komorebi_wallpaper(tag: str = "") -> dict[str, Any]:
+    params = {"format": "json", "rating": "safe"}
+    if tag:
+        params["tag"] = tag[:48]
+    last_error = "Provider wallpaper tidak merespons."
+    for host in WALLPAPER_API_HOSTS:
+        try:
+            response = requests.get(
+                f"https://{host}/image", params=params,
+                headers={"User-Agent": "NOCTURNE/1.0 (anime wallpaper gallery)", "Accept": "application/json"},
+                timeout=(4, 9), allow_redirects=True,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            image_url = payload.get("url") or payload.get("image_url")
+            if not isinstance(image_url, str) or urlparse(image_url).scheme != "https":
+                raise ValueError("Respons provider tidak memiliki URL gambar HTTPS yang valid.")
+            image_host = (urlparse(image_url).hostname or "").lower()
+            if not image_host or image_host in {"localhost", "127.0.0.1"}:
+                raise ValueError("Host gambar tidak valid.")
+            return {
+                "id": str(payload.get("id") or hashlib.sha256(image_url.encode()).hexdigest()[:12]),
+                "url": image_url,
+                "thumbnail": payload.get("thumbnail_url") or image_url,
+                "width": payload.get("width"), "height": payload.get("height"),
+                "tags": payload.get("tags") if isinstance(payload.get("tags"), list) else [],
+                "theme": payload.get("theme") or "",
+                "source": "Komorebi",
+                "source_url": "https://komorebi.orizuru.dev/",
+            }
+        except Exception as exc:
+            last_error = str(exc)[:220]
+            log.warning("Wallpaper provider %s gagal: %s", host, last_error)
+    raise RuntimeError(last_error)
+
+
+@app.get("/api/wallpapers")
+def api_wallpapers():
+    tag = clean_text(request.args.get("tag", ""))[:48]
+    try:
+        count = max(1, min(int(request.args.get("count", "8")), 12))
+    except (TypeError, ValueError):
+        count = 8
+    force_refresh = request.args.get("refresh") == "1"
+    cache_key = tag.lower()
+    now = time.time()
+    with _wallpaper_cache_lock:
+        cached = _wallpaper_cache.get(cache_key)
+        if not force_refresh and cached and now - cached[0] < 90 and len(cached[1]) >= count:
+            return jsonify({"ok": True, "items": cached[1][:count], "provider": "Komorebi", "cached": True})
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(count, 6)) as pool:
+        futures = [pool.submit(fetch_komorebi_wallpaper, tag) for _ in range(count)]
+        for future in as_completed(futures):
+            try:
+                item = future.result()
+                if all(x["url"] != item["url"] for x in items):
+                    items.append(item)
+            except Exception as exc:
+                errors.append(str(exc)[:180])
+    if not items:
+        return jsonify({"ok": False, "error": errors[0] if errors else "Wallpaper belum tersedia. Coba lagi nanti.", "provider": "Komorebi"}), 502
+    with _wallpaper_cache_lock:
+        _wallpaper_cache[cache_key] = (time.time(), items)
+    return jsonify({"ok": True, "items": items, "provider": "Komorebi", "cached": False,
+                    "partial": len(items) < count, "message": "Sebagian gambar tersedia." if len(items) < count else ""})
+
+
 @app.get("/api/home")
 def api_home():
     try:
@@ -1472,6 +1548,7 @@ button,input{font:inherit}button{cursor:pointer}.app{position:relative;z-index:1
     <button class="navbtn" data-tab="multiverse" onclick="loadTab('multiverse',this)"><span class="ico">✧</span> Multi-Source Search</button>
     <button class="navbtn" data-tab="discover" onclick="loadTab('discover',this)"><span class="ico">♛</span> Discovery Hub</button>
     <button class="navbtn" data-tab="news" onclick="loadTab('news',this)"><span class="ico">☷</span> Anime News</button>
+    <button class="navbtn" data-tab="wallpapers" onclick="loadTab('wallpapers',this)"><span class="ico">▧</span> Anime Wallpapers</button>
     <button class="navbtn" data-tab="airing" onclick="loadTab('airing',this)"><span class="ico">◷</span> Airing Calendar</button>
     <button class="navbtn" data-tab="top" onclick="loadTab('top',this)"><span class="ico">♛</span> MAL Top Anime</button>
     <button class="navbtn" data-tab="season" onclick="loadTab('season',this)"><span class="ico">☀</span> Musim Ini</button>
@@ -1538,6 +1615,7 @@ async function loadTab(tab,btn=null){if(tab!=='home'&&activeHomeBannerUrl){URL.r
  else if(tab==='multiverse'){renderMultiverseSearch();}
  else if(tab==='discover'){await loadMultiverseDiscover();}
  else if(tab==='news'){await loadAnimeNews();}
+ else if(tab==='wallpapers'){await renderAnimeWallpapers();}
  else if(tab==='airing'){await loadAiringCalendar();}
  else if(tab==='providers'){await loadProviderStatus();}
  else if(tab==='top'){await loadMalTop();}
@@ -1549,6 +1627,21 @@ async function loadTab(tab,btn=null){if(tab!=='home'&&activeHomeBannerUrl){URL.r
  else if(tab==='tools'){renderTools();}
  else if(tab==='diagnose'){await loadDiagnostics();}
  }catch(e){showError(e);}finally{statusText.textContent='SHADOW INDEX · '+(tab==='diagnose'?'DIAGNOSTICS':'CONNECTED');}}
+
+async function renderAnimeWallpapers(tag=''){
+ main.innerHTML=`<div class="hero"><div class="eyebrow">NOCTURNE · VISUAL ARCHIVE</div><h1>Anime Wallpapers</h1><p>Jelajahi wallpaper anime SFW dari katalog Komorebi. Hasil dimuat langsung dari provider; ketersediaan bergantung pada server sumber.</p></div><form class="toolbar" id="wallpaperSearchForm"><input class="field" id="wallpaperTag" style="flex:1;min-width:170px" maxlength="48" placeholder="Filter tag, contoh: fantasy, clouds, flowers" value="${esc(tag)}"><button class="action primary">Cari Wallpaper</button><button class="action" type="button" id="wallpaperRefresh">Acak Ulang</button></form><div id="wallpaperResults"><div class="loading">MEMANGGIL GALERI VISUAL</div></div><div class="notice">Sumber: Komorebi · hanya rating safe. Gambar berasal dari pihak ketiga; hak cipta tetap milik pembuat masing-masing. NOCTURNE menampilkan tautan sumber/atribusi yang tersedia.</div>`;
+ const form=document.getElementById('wallpaperSearchForm');
+ form.addEventListener('submit',async e=>{e.preventDefault();await loadAnimeWallpapers(document.getElementById('wallpaperTag').value.trim());});
+ document.getElementById('wallpaperRefresh').addEventListener('click',async()=>loadAnimeWallpapers(document.getElementById('wallpaperTag').value.trim(),true));
+ await loadAnimeWallpapers(tag);
+}
+async function loadAnimeWallpapers(tag='',refresh=false){
+ const box=document.getElementById('wallpaperResults');if(!box)return;box.innerHTML='<div class="loading">MENGAMBIL WALLPAPER SFW</div>';
+ try{const d=await api('/api/wallpapers?count=12&tag='+encodeURIComponent(tag)+(refresh?'&refresh=1':''),22000);
+ const cards=(d.items||[]).map(x=>`<article class="card"><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer" style="display:block;text-decoration:none;color:inherit"><div class="poster" style="aspect-ratio:16/10;background:#101115"><img loading="lazy" referrerpolicy="no-referrer" src="${esc(x.thumbnail||x.url)}" alt="Anime wallpaper" onerror="this.style.display='none';this.parentElement.innerHTML='<div class=\'noimg\'>IMAGE UNAVAILABLE</div>'"></div></a><div class="cardbody"><div class="cardtitle">${esc((x.tags||[]).slice(0,4).join(' · ')||'Anime wallpaper')}</div><div class="cardsub">${esc(x.width&&x.height?`${x.width} × ${x.height}`:'WALLPAPER')} · <a href="${esc(x.source_url||'https://komorebi.orizuru.dev/')}" target="_blank" rel="noopener noreferrer" style="color:#d8a7b4">SUMBER</a></div></div></article>`).join('');
+ box.innerHTML=`<div class="toolbar"><span class="pill">${(d.items||[]).length} WALLPAPERS</span><span class="pill">${esc(d.provider||'Komorebi')} · SFW</span></div>${cards?`<div class="grid">${cards}</div>`:'<div class="empty">Belum ada wallpaper untuk filter ini.</div>'}${d.partial?'<div class="notice">Sebagian hasil saja yang berhasil dimuat dari provider.</div>':''}`;
+ }catch(e){box.innerHTML=`<div class="notice error">Wallpaper provider belum dapat dihubungi: ${esc(e.message||e)}<br>Periksa koneksi lalu tekan Acak Ulang. Fitur ini tidak memakai Waifu.im.</div>`;}
+}
 
 function renderMultiverseSearch(){
  main.innerHTML=`<div class="hero"><div class="eyebrow">NOCTURNE MULTIVERSE · CROSS DATABASE</div><h1>Telusuri lima arsip anime</h1><p>Pencarian paralel ke AniList, MyAnimeList/Tenrai, MiteNime, AniMap, dan Anime News Network. Tiap sumber berjalan mandiri; kegagalan satu provider tidak menghapus hasil provider lain.</p></div><form class="toolbar" id="multiSearchForm"><input class="field" id="multiQuery" style="flex:1;min-width:190px" placeholder="Contoh: Frieren, One Piece, Jujutsu Kaisen..." required><button class="action primary">Cari Semua Sumber</button></form><div id="multiResults"><div class="empty">Masukkan judul untuk memulai pencarian multi-sumber.</div></div><div class="notice">Data dikutip dari penyedia masing-masing. AniList memiliki batas dan ketentuan penggunaan tersendiri, termasuk pembatasan aplikasi tracker yang bersaing; periksa Terms sebelum memakai atau mendistribusikan integrasi tersebut. NOCTURNE hanya melakukan pencarian langsung dan cache sementara, bukan mengarsipkan massal. Anime News Network ditautkan dan diberi atribusi.</div>`;
