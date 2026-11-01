@@ -201,16 +201,34 @@ def get_soup(url: str, *, use_cache: bool = True) -> tuple[BeautifulSoup, str]:
 
 
 def get_img_url(img: Tag | None) -> str | None:
+    """Read real poster URLs from common lazy-loading attributes used by anime sites."""
     if not isinstance(img, Tag):
         return None
-    for key in ("data-src", "data-lazy-src", "data-original", "src", "data-srcset", "srcset"):
+    # Lazy attributes must be checked before src: src is often a 1x1 placeholder.
+    keys = (
+        "data-src", "data-lazy-src", "data-lazy", "data-original",
+        "data-cfsrc", "data-url", "data-srcset", "data-lazy-srcset",
+        "srcset", "src",
+    )
+    for key in keys:
         raw = img.get(key)
         if not raw:
             continue
         if "srcset" in key:
-            raw = str(raw).split(",")[0].strip().split(" ")[0]
+            candidates = [part.strip().split()[0] for part in str(raw).split(",") if part.strip()]
+            raw = candidates[-1] if candidates else ""
         candidate = safe_http_url(urljoin(BASE_URL + "/", str(raw)))
         if candidate and not candidate.startswith("data:"):
+            # Ignore known transparent/blank placeholders so later attributes can win.
+            if re.search(r"(?:blank|placeholder|transparent|1x1)\.(?:gif|png|jpe?g|webp)(?:[?#]|$)", candidate, re.I):
+                continue
+            return candidate
+    # Some themes put the poster in a CSS background instead of an <img>.
+    style = str(img.get("style", ""))
+    match = re.search(r"background(?:-image)?\s*:[^;]*url\([\"']?([^\"')]+)", style, re.I)
+    if match:
+        candidate = safe_http_url(urljoin(BASE_URL + "/", match.group(1).strip()))
+        if candidate:
             return candidate
     return None
 
@@ -247,17 +265,23 @@ def best_image(soup: BeautifulSoup, scope: Tag | BeautifulSoup | None = None) ->
 
 
 def card_text_container(anchor: Tag) -> Tag:
+    """Find a card wrapper that contains both title and, where possible, its poster."""
     parent: Tag = anchor
-    for _ in range(4):
+    best: Tag = anchor.parent if isinstance(anchor.parent, Tag) else anchor
+    for _ in range(9):
         if not isinstance(parent.parent, Tag):
             break
         parent = parent.parent
-        if parent.name in ("article", "li") or any(
-            token in " ".join(parent.get("class", []))
-            for token in ("venz", "detpost", "thumb", "item", "card", "anime")
-        ):
+        classes = " ".join(parent.get("class", [])).lower()
+        has_image = bool(parent.find("img") or parent.select_one("picture source[srcset]"))
+        looks_like_card = parent.name in ("article", "li") or any(
+            token in classes for token in ("venz", "detpost", "thumb", "item", "card", "anime", "bsx", "listupd")
+        )
+        if has_image:
             return parent
-    return anchor.parent if isinstance(anchor.parent, Tag) else anchor
+        if looks_like_card:
+            best = parent
+    return best
 
 
 def parse_anime_cards(soup: BeautifulSoup, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -282,8 +306,34 @@ def parse_anime_cards(soup: BeautifulSoup, *, limit: int = 100) -> list[dict[str
         if text.lower() in {"anime", "selengkapnya", "detail", "read more"}:
             continue
         image = None
-        for img in container.find_all("img"):
-            image = get_img_url(img)
+        # Poster and title links are frequently siblings, so inspect the selected
+        # wrapper and then progressively wider ancestors instead of only 4 levels.
+        image_scopes: list[Tag] = [container]
+        ancestor: Tag = container
+        for _ in range(5):
+            if not isinstance(ancestor.parent, Tag):
+                break
+            ancestor = ancestor.parent
+            image_scopes.append(ancestor)
+        seen_images: set[int] = set()
+        for scope in image_scopes:
+            for img in scope.select("img"):
+                marker = id(img)
+                if marker in seen_images:
+                    continue
+                seen_images.add(marker)
+                image = get_img_url(img)
+                if image:
+                    break
+            if image:
+                break
+            for source in scope.select("picture source[srcset]"):
+                raw = str(source.get("data-srcset") or source.get("srcset") or "")
+                if raw:
+                    candidate = safe_http_url(urljoin(BASE_URL + "/", raw.split(",")[-1].strip().split()[0]))
+                    if candidate:
+                        image = candidate
+                        break
             if image:
                 break
         date_text = ""
