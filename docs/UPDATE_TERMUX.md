@@ -1,8 +1,8 @@
-# Update NOCTURNE 4.2 from Termux
+# Update NOCTURNE 4.3.0 from Termux
 
-The source ZIP intentionally excludes `.git`, so applying it will not overwrite the GitHub remote, branch history, or local credentials in your existing checkout.
+ZIP source ini tidak menyertakan `.git`; riwayat, branch, dan kredensial Git lokal tetap utuh.
 
-## 1. Install Termux tools and back up local data
+## 1. Siapkan Termux
 
 ```bash
 pkg update -y
@@ -11,47 +11,51 @@ termux-setup-storage
 mkdir -p ~/projects
 ```
 
-Back up `nocturne.db` first if you run the Flask project directly from Termux. For the installed APK, export **Tools & Backup → Ekspor JSON** before replacing the app.
+Simpan `NOCTURNE-Streaming-Android-4.3.0.zip` ke folder Download Android.
 
-## 2. Prepare your repository checkout
+## 2. Perbarui checkout yang sudah ada
 
-If you already cloned the project, open that folder. Otherwise, clone it once:
+Jika repo belum pernah di-clone, clone sekali: 
 
 ```bash
 git clone https://github.com/zepar620-rgb/NOCTURNE-Streaming-Android.git ~/projects/NOCTURNE-Streaming-Android
 ```
 
-Copy `NOCTURNE-Streaming-Android-4.2.0.zip` into Android's Download folder, then overlay the updated files onto the checkout:
+Lalu overlay file baru ke checkout (gunakan folder induk repo, bukan folder repo itu sendiri):
 
 ```bash
 cd ~/projects/NOCTURNE-Streaming-Android
 git pull --rebase origin main
-unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.2.0.zip -d ~/projects
+unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.3.0.zip -d ~/projects
 git status
 ```
 
-The ZIP has a `NOCTURNE-Streaming-Android/` top-level folder, so extraction into `~/projects` updates the matching checkout without touching `.git`. If your checkout lives elsewhere, replace `~/projects` with its parent folder.
+Jika checkout berada di folder lain, ganti `~/projects` pada perintah unzip dengan folder induk checkout. Periksa `git status` dan selesaikan konflik sebelum commit.
 
-## 3. Commit and push the update
+## 3. Commit dan push
 
 ```bash
 cd ~/projects/NOCTURNE-Streaming-Android
 git add -A
-git commit -m "NOCTURNE 4.2: Pinterest wallpapers, stream resolutions and anime quotes"
+git commit -m "NOCTURNE 4.3: vertical anime list and wallpaper preview"
 git push origin main
 ```
 
-Authenticate with your GitHub username and a Personal Access Token when Git prompts for a password. Do not put the token directly in the command or source files. If Git reports a non-fast-forward update, run `git pull --rebase origin main`, resolve conflicts, then repeat the push.
+Jangan menaruh Personal Access Token langsung di perintah atau file source.
 
-## 4. Build the APK from GitHub Actions
+## 4. Build APK
 
-After the push succeeds, open the repository → **Actions** → **Build NOCTURNE Android APK**. Open the newest successful run and download **`NOCTURNE-4.2-debug-APK`** from Artifacts. Extract the artifact ZIP to get `app-debug.apk`.
+Setelah push, buka GitHub → **Actions** → **Build NOCTURNE Android APK**. Pilih run paling baru yang berhasil dan unduh artifact **`NOCTURNE-4.3-debug-APK`**. Extract artifact ZIP untuk memperoleh `app-debug.apk`.
 
-You can also build locally where Gradle 8.13, JDK 17, Python 3.11 and Android SDK Platform 36 are installed:
+Build lokal memerlukan JDK 17, Android SDK Platform 36, Gradle 8.13, dan Python 3.11:
 
 ```bash
 cd ~/projects/NOCTURNE-Streaming-Android
 gradle --no-daemon --stacktrace :app:assembleDebug
 ```
 
-The resulting APK is `app/build/outputs/apk/debug/app-debug.apk`. The project archive is source code, not an APK installer.
+APK lokal akan berada di `app/build/outputs/apk/debug/app-debug.apk`. Arsip source ZIP bukan APK installer.
+
+## 5. Setelah memasang APK
+
+Sebelum mengganti APK versi lama, ekspor data dari **Tools & Backup → Ekspor JSON**. Setelah instalasi, impor kembali jika diperlukan. Untuk unduhan wallpaper, gunakan tombol **Simpan** atau **Download wallpaper**; file gambar akan diproses melalui Android Download Manager.

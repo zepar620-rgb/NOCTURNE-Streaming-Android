@@ -7,7 +7,8 @@ import re
 import unittest
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup, Tag
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "app/src/main/python/otakudesu_gothic.py"
@@ -29,22 +30,40 @@ def safe_http_url(value: str | None) -> str | None:
     return value if parsed.scheme in ("http", "https") else None
 
 
+def site_url(value: str) -> str:
+    absolute = urljoin("https://otakudesu.blog/", value)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in {"otakudesu.blog", "www.otakudesu.blog"}:
+        raise ValueError("not OtakuDesu")
+    return absolute
+
+
 NAMES = {
     "_https_url",
     "_nested_image_value",
     "_walk_dicts",
     "normalize_pinterest_results",
     "normalize_stream_groups",
+    "_anime_group_key",
+    "_group_anime_items",
+    "parse_anime_list_groups",
+    "_is_pinterest_image_host",
 }
 
 namespace: dict[str, Any] = {
     "Any": Any,
+    "BASE_URL": "https://otakudesu.blog",
     "re": re,
     "urlparse": urlparse,
     "clean_text": clean_text,
     "safe_http_url": safe_http_url,
+    "site_url": site_url,
+    "urljoin": urljoin,
+    "urlparse": urlparse,
+    "Tag": Tag,
+    "BeautifulSoup": BeautifulSoup,
     "_UNSAFE_MEDIA_TERMS": re.compile(
-        r"\b(?:hentai|ecchi|porn|pornography|nsfw|r18|adult only|nude|naked|lewd|explicit)\b",
+        r"(?:\b(?:hentai|ecchi|porn|pornography|nsfw|r18|adult only|nude|naked|lewd|explicit)\b|18\+)",
         re.IGNORECASE,
     ),
 }
@@ -92,10 +111,39 @@ class MediaNormalizerTests(unittest.TestCase):
             "links": [{"name": "host-secure", "embed": "https://video.example/embed/abc"}],
         }])
 
+    def test_anime_list_keeps_the_heading_and_vertical_link_groups(self) -> None:
+        html = """<main><h1>Daftar Anime</h1>
+        <h2>#</h2><ul><li><a href='/anime/compass/'>#Compass 2.0</a></li></ul>
+        <h2>1</h2><ul><li><a href='/anime/one/'>100-man no Inochi</a></li>
+        <li><a href='/anime/eyes/'>11eyes</a></li></ul>
+        <h2>A</h2><ul><li><a href='/anime/a-channel/'>A-Channel</a></li></ul>
+        <h2>About</h2><a href='/anime/not-a-group/'>not included</a></main>"""
+        groups = namespace["parse_anime_list_groups"](BeautifulSoup(html, "html.parser"))
+        self.assertEqual([g["label"] for g in groups], ["#", "1", "A"])
+        self.assertEqual([item["title"] for item in groups[1]["items"]], ["100-man no Inochi", "11eyes"])
+        self.assertNotIn("image", groups[0]["items"][0])
+
+    def test_anime_list_falls_back_to_initial_character_groups(self) -> None:
+        html = """<main><a href='/anime/zeta/'>Zeta</a><a href='/anime/alpha/'>Alpha</a>
+        <a href='/anime/number/'>86</a><a href='https://example.com/anime/outside/'>Outside</a></main>"""
+        groups = namespace["parse_anime_list_groups"](BeautifulSoup(html, "html.parser"))
+        self.assertEqual([g["label"] for g in groups], ["8", "A", "Z"])
+
+    def test_wallpaper_download_host_guard(self) -> None:
+        safe = namespace["_is_pinterest_image_host"]
+        self.assertTrue(safe("https://i.pinimg.com/originals/demo.jpg"))
+        self.assertFalse(safe("http://i.pinimg.com/demo.jpg"))
+        self.assertFalse(safe("https://pinimg.com.evil.example/demo.jpg"))
+        self.assertFalse(safe("https://user:pass@i.pinimg.com/demo.jpg"))
+
     def test_expected_proxy_routes_exist(self) -> None:
         self.assertIn('"/api/search/pinterest"', SOURCE_TEXT)
         self.assertIn('"/api/nonton/otakudesu/stream"', SOURCE_TEXT)
         self.assertIn('"https://api.animechan.io/v1/quotes/random"', SOURCE_TEXT)
+        self.assertIn('@app.get("/api/wallpapers/download")', SOURCE_TEXT)
+        self.assertIn('BASE_URL + "/anime-list/"', SOURCE_TEXT)
+        self.assertIn('BASE_URL + "/genre-list/"', SOURCE_TEXT)
+        self.assertIn('function openWallpaperPreview', SOURCE_TEXT)
 
 
 if __name__ == "__main__":

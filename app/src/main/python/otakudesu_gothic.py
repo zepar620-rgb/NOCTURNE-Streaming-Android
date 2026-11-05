@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import hashlib
+import io
 import xml.etree.ElementTree as ET
 import threading
 import time
@@ -26,7 +27,7 @@ from urllib.parse import quote, urljoin, urlparse, urlencode
 
 import requests
 from bs4 import BeautifulSoup, Tag
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, send_file
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -392,28 +393,94 @@ def parse_home() -> dict[str, Any]:
     return {"title": page_title(soup), "items": items, "source": final_url}
 
 
+def _anime_group_key(label: str) -> str | None:
+    value = clean_text(label).upper()
+    if value == "#" or re.fullmatch(r"[0-9]", value) or re.fullmatch(r"[A-Z]", value):
+        return value
+    return None
+
+
+def _group_anime_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group plain anime links by their leading symbol/number/letter."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for item in items:
+        title = clean_text(str(item.get("title") or ""))
+        if not title:
+            continue
+        first = title[0].upper()
+        key = first if first.isalnum() and (first.isdigit() or "A" <= first <= "Z") else "#"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+    # Match the source's common order: symbols, 0–9, then A–Z.
+    order.sort(key=lambda x: (0, x) if x == "#" else (1, int(x)) if x.isdigit() else (2, x))
+    return [{"label": key, "items": groups[key]} for key in order]
+
+
+def parse_anime_list_groups(soup: BeautifulSoup) -> list[dict[str, Any]]:
+    """Read the site's alphabetic heading/list structure instead of scraping poster cards."""
+    groups: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    headings = soup.find_all(["h2", "h3", "h4"])
+    for heading in headings:
+        key = _anime_group_key(heading.get_text(" ", strip=True))
+        if not key:
+            continue
+        group_items: list[dict[str, Any]] = []
+        for node in heading.find_all_next(["h2", "h3", "h4", "a"]):
+            if node.name in ("h2", "h3", "h4"):
+                break
+            href = safe_http_url(urljoin(BASE_URL + "/", str(node.get("href", ""))))
+            title = clean_text(node.get_text(" ", strip=True))
+            if not href or not title or _UNSAFE_MEDIA_TERMS.search(title):
+                continue
+            try:
+                href = site_url(href)
+            except ValueError:
+                continue
+            if "/anime/" not in urlparse(href).path or href in seen:
+                continue
+            seen.add(href)
+            group_items.append({"title": title, "url": href})
+        if group_items:
+            groups.append({"label": key, "items": group_items})
+
+    # If the theme changes and removes alphabet headings, preserve the full list
+    # as vertical groups based on each title's first character.
+    if not groups:
+        flat: list[dict[str, Any]] = []
+        for anchor in soup.select('a[href*="/anime/"]'):
+            href = safe_http_url(urljoin(BASE_URL + "/", str(anchor.get("href", ""))))
+            title = clean_text(anchor.get_text(" ", strip=True))
+            if not href or not title or _UNSAFE_MEDIA_TERMS.search(title):
+                continue
+            try:
+                href = site_url(href)
+            except ValueError:
+                continue
+            if "/anime/" in urlparse(href).path and href not in seen:
+                seen.add(href)
+                flat.append({"title": title, "url": href})
+        groups = _group_anime_items(flat)
+    return groups
+
+
 def parse_catalog(section: str, page: int = 1) -> dict[str, Any]:
     page = max(1, min(int(page), 100))
     if section == "ongoing":
         path = "/ongoing-anime/" if page == 1 else f"/ongoing-anime/page/{page}/"
-    elif section == "anime-list":
-        path = "/anime-list/"
-    else:
-        raise ValueError("Katalog tidak dikenal")
-    soup, final_url = get_soup(urljoin(BASE_URL, path))
-    items = parse_anime_cards(soup, limit=500 if section == "anime-list" else 100)
-    if section == "anime-list" and not items:
-        # Anime list page may be plain alphabetic links without a card wrapper.
-        for a in soup.select('a[href*="/anime/"]'):
-            href = safe_http_url(urljoin(BASE_URL + "/", str(a.get("href", ""))))
-            title = clean_text(a.get_text(" ", strip=True))
-            if href and title:
-                try:
-                    site_url(href)
-                    items.append({"title": title, "url": href, "image": None, "subtitle": ""})
-                except ValueError:
-                    pass
-    return {"title": page_title(soup), "items": items, "page": page, "source": final_url}
+        soup, final_url = get_soup(urljoin(BASE_URL, path))
+        items = parse_anime_cards(soup, limit=100)
+        return {"title": page_title(soup), "items": items, "page": page, "source": final_url}
+    if section == "anime-list":
+        soup, final_url = get_soup(BASE_URL + "/anime-list/")
+        groups = parse_anime_list_groups(soup)
+        items = [item for group in groups for item in group["items"]]
+        return {"title": page_title(soup), "groups": groups, "items": items,
+                "total": len(items), "page": 1, "source": final_url}
+    raise ValueError("Katalog tidak dikenal")
 
 
 def parse_schedule() -> dict[str, Any]:
@@ -450,7 +517,9 @@ def parse_schedule() -> dict[str, Any]:
 
 def parse_genre_list() -> dict[str, Any]:
     soup, final_url = get_soup(BASE_URL + "/genre-list/")
-    return {"title": page_title(soup), "genres": parse_genres(soup), "source": final_url}
+    genres = [g for g in parse_genres(soup)
+              if not re.search(r"\b(?:ecchi|hentai|adult|r18)\b|18\+", g["title"], re.I)]
+    return {"title": page_title(soup), "genres": genres, "source": final_url}
 
 
 def parse_search(query: str) -> dict[str, Any]:
@@ -1114,7 +1183,7 @@ def api_health():
 BINTANG_API_BASE = "https://bintangapi.my.id"
 BINTANG_TIMEOUT = (6, 20)
 _bintang_headers = {
-    "User-Agent": "NOCTURNE-Android/4.2 (personal anime archive)",
+    "User-Agent": "NOCTURNE-Android/4.3 (personal anime archive)",
     "Accept": "application/json",
 }
 _wallpaper_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -1127,7 +1196,7 @@ _quote_cache_lock = threading.Lock()
 # Pinterest search results are public user-generated content. Keep searches and
 # returned labels away from adult/explicit categories for this teen-facing app.
 _UNSAFE_MEDIA_TERMS = re.compile(
-    r"\b(?:hentai|ecchi|porn|pornography|nsfw|r18|adult only|nude|naked|lewd|explicit)\b",
+    r"(?:\b(?:hentai|ecchi|porn|pornography|nsfw|r18|adult only|nude|naked|lewd|explicit)\b|18\+)",
     re.IGNORECASE,
 )
 
@@ -1293,6 +1362,67 @@ def api_wallpapers():
                     "partial": len(items) < count})
 
 
+def _is_pinterest_image_host(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return (parsed.scheme == "https" and not parsed.username and not parsed.password
+                and parsed.port in (None, 443)
+                and (host == "pinimg.com" or host.endswith(".pinimg.com")))
+    except ValueError:
+        return False
+
+
+@app.get("/api/wallpapers/download")
+def api_wallpaper_download():
+    """Download an image from Pinterest's image CDN; never proxy arbitrary URLs."""
+    image_url = request.args.get("url", "")[:2048]
+    if not _is_pinterest_image_host(image_url):
+        return jsonify({"ok": False, "error": "Unduhan hanya tersedia untuk gambar dari CDN Pinterest yang aman."}), 400
+    try:
+        response = requests.get(
+            image_url,
+            headers={"User-Agent": USER_AGENT, "Referer": "https://www.pinterest.com/", "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"},
+            timeout=(6, 18),
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400:
+            return jsonify({"ok": False, "error": "CDN meminta pengalihan; unduhan dihentikan demi keamanan."}), 400
+        response.raise_for_status()
+        content_length = response.headers.get("Content-Length")
+        if content_length and content_length.isdigit() and int(content_length) > 15 * 1024 * 1024:
+            return jsonify({"ok": False, "error": "Ukuran gambar melebihi batas 15 MB."}), 413
+        mime = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0].strip().lower()
+        allowed = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif"}
+        if mime not in allowed:
+            return jsonify({"ok": False, "error": "Sumber tidak mengirim file gambar yang didukung."}), 415
+        data = io.BytesIO()
+        total = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > 15 * 1024 * 1024:
+                return jsonify({"ok": False, "error": "Ukuran gambar melebihi batas 15 MB."}), 413
+            data.write(chunk)
+        if total == 0:
+            return jsonify({"ok": False, "error": "File gambar kosong."}), 502
+        data.seek(0)
+        raw_name = clean_text(request.args.get("name", "NOCTURNE-wallpaper"))[:80]
+        base_name = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_name).strip("_-") or "NOCTURNE-wallpaper"
+        return send_file(data, mimetype=mime, as_attachment=True,
+                         download_name=base_name + allowed[mime], max_age=0)
+    except requests.RequestException as exc:
+        log.warning("Wallpaper download gagal: %s", str(exc)[:180])
+        return jsonify({"ok": False, "error": "Server gambar Pinterest tidak dapat dijangkau. Coba lagi."}), 502
+    finally:
+        try:
+            response.close()
+        except (UnboundLocalError, AttributeError):
+            pass
+
+
 def normalize_stream_groups(data: dict[str, Any]) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = []
     for group in data.get("streams", []) if isinstance(data.get("streams"), list) else []:
@@ -1362,7 +1492,7 @@ def fetch_random_anime_quote() -> dict[str, Any]:
     global _quote_cache
     response = requests.get(
         "https://api.animechan.io/v1/quotes/random",
-        headers={"User-Agent": "NOCTURNE-Android/4.2", "Accept": "application/json"},
+        headers={"User-Agent": "NOCTURNE-Android/4.3", "Accept": "application/json"},
         timeout=(5, 12),
     )
     response.raise_for_status()
@@ -1740,7 +1870,9 @@ button,input{font:inherit}button{cursor:pointer}.app{position:relative;z-index:1
 .hero-media{position:absolute;inset:0;z-index:0;overflow:hidden}.hero-media img,.hero-media video{display:block;width:100%;height:100%;object-fit:cover;object-position:center}.hero-shade{position:absolute;inset:0;z-index:1;pointer-events:none;background:linear-gradient(90deg,#111318e8,#111318b5 62%,#11131875)}.hero-content{position:relative;z-index:2}.hero.has-custom-media{background-image:none}.hero.has-custom-media:before,.hero.has-custom-media:after{display:none}.appearance-preview{position:relative;overflow:hidden;min-height:150px;aspect-ratio:16/5;border:1px solid #45484f;border-radius:6px;background:linear-gradient(120deg,#303238,#15171b);margin:12px 0 16px}.appearance-preview img,.appearance-preview video{width:100%;height:100%;position:absolute;inset:0;object-fit:cover}.appearance-preview .preview-fallback{position:absolute;inset:0;display:grid;place-items:center;color:#b9aeb4;font:12px Arial,sans-serif;letter-spacing:2px}
 .appearance-preview.default-motion:after{content:"";position:absolute;inset:-45%;pointer-events:none;background:radial-gradient(ellipse at 18% 45%,#9e304c66,transparent 32%),radial-gradient(ellipse at 78% 58%,#c5b5be30,transparent 28%),linear-gradient(110deg,transparent 38%,#fff2 50%,transparent 62%);background-size:160% 160%;animation:nocturneBannerDrift 13s ease-in-out infinite alternate,nocturneBannerPulse 7s ease-in-out infinite}
 .appearance-preview .default-banner{width:100%;height:100%;position:absolute;inset:0;object-fit:cover}
-.eyebrow{font:10px Arial,sans-serif;letter-spacing:4px;color:var(--gold);text-transform:uppercase}.hero h1{font-size:clamp(26px,4vw,42px);font-weight:normal;letter-spacing:1px;margin:9px 0}.hero p{color:#c0adb7;max-width:660px;font-size:14px;line-height:1.65;margin:0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:25px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line)}.section-head h2{font-size:21px;font-weight:normal;letter-spacing:1.5px;margin:0}.section-head small{font:10px Arial,sans-serif;color:var(--muted);letter-spacing:2px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:17px}.card{min-width:0;background:linear-gradient(160deg,#222429,#181a1e);border:1px solid #363940;border-radius:5px;overflow:hidden;cursor:pointer;transition:transform .18s,border-color .18s,box-shadow .18s}.card:hover{transform:translateY(-4px);border-color:#934157;box-shadow:0 12px 26px #0008}.poster{aspect-ratio:2/2.85;background:linear-gradient(145deg,#30202b,#100c10);position:relative;overflow:hidden}.poster img{display:block;width:100%;height:100%;object-fit:cover}.poster .noimg{height:100%;display:grid;place-items:center;color:#754052;font-size:38px}.cardbody{padding:10px 11px 12px}.cardtitle{font-size:13px;line-height:1.35;min-height:35px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:#f0e5e9}.cardsub{font:10px Arial,sans-serif;color:var(--gold);margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pill{display:inline-block;border:1px solid #714052;color:#d7a2af;padding:4px 8px;font:10px Arial,sans-serif;letter-spacing:1px;border-radius:20px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}.action{border:1px solid #633448;background:#241720;color:#eadde2;padding:9px 13px;border-radius:3px;font:12px Arial,sans-serif}.action:hover{background:#592338}.action.primary{background:var(--red);border-color:var(--red);color:white}.content-card{background:#1b1d21;border:1px solid var(--line);border-radius:6px;padding:19px;margin-bottom:18px}.detail-grid{display:grid;grid-template-columns:minmax(160px,230px) minmax(0,1fr);gap:23px}.detail-poster{width:100%;max-height:340px;object-fit:cover;border:1px solid #503344;border-radius:4px}.detail-title{font-size:clamp(22px,3vw,34px);font-weight:normal;line-height:1.2;margin:2px 0 13px}.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:14px 0}.meta div{background:#131518;border:1px solid #34373d;padding:9px 10px;font:12px/1.45 Arial,sans-serif;color:#d8cbd1}.meta b{display:block;color:var(--gold);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}.desc{font:13px/1.7 Arial,sans-serif;color:#bcaeb6}.list{display:grid;gap:7px}.listbtn{width:100%;text-align:left;background:#1a1c20;border:1px solid #383b42;color:var(--text);padding:12px 13px;border-radius:3px;font-size:13px}.listbtn:hover{border-color:var(--red);background:#28151f}.daytitle{color:var(--gold);letter-spacing:2px;font-size:13px;margin:22px 0 10px}.playerbox{background:#08090b;border:1px solid #45484f;border-radius:5px;overflow:hidden}.playerbox iframe{display:block;width:100%;aspect-ratio:16/9;min-height:230px;border:0;background:#000}.playerbox{box-shadow:0 14px 32px #0009}.player-tools .action.primary{min-width:112px;font-weight:bold;letter-spacing:1px}.quote-card{max-width:900px;margin:22px auto;padding:clamp(22px,5vw,48px);background:radial-gradient(ellipse at 50% 0%,#ffffff12,transparent 65%),#17191d;border:1px solid #555960;text-align:center}.quote-text{font-size:clamp(22px,4vw,34px);line-height:1.55;color:#f0edf0;margin:28px auto;max-width:760px;font-family:Georgia,serif}.quote-meta{display:grid;gap:5px;color:#d7c7ce}.quote-meta strong{font-size:14px;letter-spacing:1px}.quote-meta span{font:12px Arial,sans-serif;color:var(--gold)}.quote-meta small{font:9px Arial,sans-serif;letter-spacing:2px;color:var(--muted)}.player-state{border-radius:0 3px 3px 0}.player-poster{padding:10px;border:1px solid var(--line);background:#15171b;border-radius:6px}.player-poster .ep-name{font-size:18px}.player-poster .eyebrow{margin-bottom:6px}.player-tools{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.server-select{background:#23252a;color:#eee5e8;border:1px solid #494c54;padding:9px 10px;border-radius:3px;max-width:100%;font:12px Arial,sans-serif}.player-state{font:12px/1.6 Arial,sans-serif;color:#cbb9c2;padding:10px 12px;background:#15171b;border-left:3px solid #9e304c;margin-top:10px}.player-poster{display:flex;gap:14px;align-items:center;margin-bottom:14px}.player-poster img{width:76px;height:108px;object-fit:cover;border:1px solid #704052;border-radius:3px}.player-poster .ep-name{font-size:17px;line-height:1.35}.server-chip{display:inline-block;padding:5px 9px;border:1px solid #5c3546;color:#d8a7b4;font:10px Arial,sans-serif;margin:3px;border-radius:20px}.player-placeholder{padding:45px 16px;text-align:center;color:var(--muted);font:13px/1.7 Arial,sans-serif}.source-link{display:inline-block;color:#e9b6c2;text-decoration:none;border-bottom:1px solid #8e4258;padding-bottom:2px;font:12px Arial,sans-serif;margin:12px 0}.source-link:hover{color:white}.notice{border:1px solid #795d3d;background:#281f17;color:#d6c09e;padding:12px 14px;border-radius:4px;font:12px/1.6 Arial,sans-serif;margin:12px 0}.error{border-color:#8c3347;background:#2b151d;color:#f0b5c1}.loading{padding:50px 15px;text-align:center;color:var(--gold);letter-spacing:3px}.loading:after{content:"";display:block;width:26px;height:26px;border:2px solid #663347;border-top-color:var(--red2);border-radius:50%;margin:15px auto 0;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty{padding:40px 15px;text-align:center;color:var(--muted);border:1px dashed #493340;border-radius:4px;font:13px Arial,sans-serif}.diagrow{display:grid;grid-template-columns:minmax(120px,1fr) 70px minmax(0,2fr);gap:10px;padding:10px;border-bottom:1px solid var(--line);font:12px Arial,sans-serif;align-items:center}.ok{color:#8ccea2}.bad{color:#e18b9b}.muted{color:var(--muted);font:11px Arial,sans-serif}.footer{margin-top:55px;padding:20px 0;border-top:1px solid var(--line);color:#7e6d77;font:10px/1.7 Arial,sans-serif;letter-spacing:.5px}
+.eyebrow{font:10px Arial,sans-serif;letter-spacing:4px;color:var(--gold);text-transform:uppercase}.hero h1{font-size:clamp(26px,4vw,42px);font-weight:normal;letter-spacing:1px;margin:9px 0}.hero p{color:#c0adb7;max-width:660px;font-size:14px;line-height:1.65;margin:0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:25px 0 16px;padding-bottom:10px;border-bottom:1px solid var(--line)}.section-head h2{font-size:21px;font-weight:normal;letter-spacing:1.5px;margin:0}.section-head small{font:10px Arial,sans-serif;color:var(--muted);letter-spacing:2px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:17px}.card{min-width:0;background:linear-gradient(160deg,#222429,#181a1e);border:1px solid #363940;border-radius:5px;overflow:hidden;cursor:pointer;transition:transform .18s,border-color .18s,box-shadow .18s}.card:hover{transform:translateY(-4px);border-color:#934157;box-shadow:0 12px 26px #0008}.poster{aspect-ratio:2/2.85;background:linear-gradient(145deg,#30202b,#100c10);position:relative;overflow:hidden}.poster img{display:block;width:100%;height:100%;object-fit:cover}.poster .noimg{height:100%;display:grid;place-items:center;color:#754052;font-size:38px}.cardbody{padding:10px 11px 12px}.cardtitle{font-size:13px;line-height:1.35;min-height:35px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:#f0e5e9}.cardsub{font:10px Arial,sans-serif;color:var(--gold);margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pill{display:inline-block;border:1px solid #714052;color:#d7a2af;padding:4px 8px;font:10px Arial,sans-serif;letter-spacing:1px;border-radius:20px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}.action{border:1px solid #633448;background:#241720;color:#eadde2;padding:9px 13px;border-radius:3px;font:12px Arial,sans-serif}.action:hover{background:#592338}.action.primary{background:var(--red);border-color:var(--red);color:white}.content-card{background:#1b1d21;border:1px solid var(--line);border-radius:6px;padding:19px;margin-bottom:18px}.detail-grid{display:grid;grid-template-columns:minmax(160px,230px) minmax(0,1fr);gap:23px}.detail-poster{width:100%;max-height:340px;object-fit:cover;border:1px solid #503344;border-radius:4px}.detail-title{font-size:clamp(22px,3vw,34px);font-weight:normal;line-height:1.2;margin:2px 0 13px}.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:14px 0}.meta div{background:#131518;border:1px solid #34373d;padding:9px 10px;font:12px/1.45 Arial,sans-serif;color:#d8cbd1}.meta b{display:block;color:var(--gold);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}.desc{font:13px/1.7 Arial,sans-serif;color:#bcaeb6}.list{display:grid;gap:7px}.listbtn{width:100%;text-align:left;background:#1a1c20;border:1px solid #383b42;color:var(--text);padding:12px 13px;border-radius:3px;font-size:13px}.listbtn:hover{border-color:var(--red);background:#28151f}.daytitle{color:var(--gold);letter-spacing:2px;font-size:13px;margin:22px 0 10px}
+.anime-index{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 18px}.anime-index a{min-width:29px;text-align:center;text-decoration:none;color:#e7dce1;background:#1c1e22;border:1px solid #41444b;border-radius:3px;padding:6px 8px;font:12px Arial,sans-serif}.anime-index a:hover{border-color:var(--red2);background:#2b1720}.anime-filter{width:100%;max-width:520px;margin:0 0 16px}.anime-group{margin:19px 0 24px;scroll-margin-top:90px}.anime-group-head{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #3b4550;padding:0 4px 8px;margin-bottom:9px}.anime-group-head h3{font-size:17px;font-weight:normal;letter-spacing:1.5px;margin:0;color:#f0e8ec}.anime-group-head span{font:10px Arial,sans-serif;color:var(--muted)}.anime-rows{display:grid;gap:2px}.anime-row{display:flex;align-items:flex-start;gap:10px;width:100%;border:0;border-bottom:1px solid #ffffff0b;background:transparent;color:#d5d0d3;text-align:left;padding:8px 7px;font:14px/1.55 Arial,sans-serif;border-radius:2px}.anime-row:before{content:'•';color:#888;flex:0 0 10px}.anime-row:hover{background:#ffffff09;color:#fff}.genre-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 16px}.genre-cloud{display:flex;flex-wrap:wrap;align-items:center;gap:9px 12px;padding:4px 2px 18px}.genre-chip{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:1px solid #3c4149;border-radius:3px;background:#1b1e23;color:#e2d9de;padding:9px 13px;font:13px Arial,sans-serif;min-height:38px;max-width:100%}.genre-chip:hover{border-color:var(--red2);background:#291822;color:#fff}.wallpaper-card{overflow:hidden}.wallpaper-thumb{display:block;width:100%;aspect-ratio:3/4;background:#101115;object-fit:cover;cursor:zoom-in}.wallpaper-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.wallpaper-lightbox{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.94);display:flex;align-items:center;justify-content:center;padding:16px;overflow:auto}.wallpaper-lightbox-inner{width:min(100%,980px);max-height:100%;display:flex;flex-direction:column;gap:12px;align-items:center}.wallpaper-lightbox img{display:block;max-width:100%;max-height:calc(100dvh - 170px);width:auto;height:auto;object-fit:contain;border:1px solid #393b40;box-shadow:0 18px 60px #000}.wallpaper-lightbox-bar{width:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:space-between}.wallpaper-lightbox-title{flex:1;min-width:120px;color:#f4edf0;font:13px/1.4 Arial,sans-serif}.wallpaper-lightbox-close{position:fixed;top:12px;right:12px;z-index:2;width:42px;height:42px;border:1px solid #777;background:#17191d;color:white;border-radius:50%;font-size:22px}.wallpaper-lightbox .action{display:inline-flex;align-items:center;justify-content:center;text-decoration:none}.wallpaper-lightbox-error{color:#e0b5bf;font:12px Arial,sans-serif;text-align:center}@media(max-width:600px){.wallpaper-lightbox{padding:10px}.wallpaper-lightbox img{max-height:calc(100dvh - 190px)}.genre-cloud{gap:7px}.genre-chip{padding:8px 10px;font-size:12px}.anime-row{font-size:13px}}
+.playerbox{background:#08090b;border:1px solid #45484f;border-radius:5px;overflow:hidden}.playerbox iframe{display:block;width:100%;aspect-ratio:16/9;min-height:230px;border:0;background:#000}.playerbox{box-shadow:0 14px 32px #0009}.player-tools .action.primary{min-width:112px;font-weight:bold;letter-spacing:1px}.quote-card{max-width:900px;margin:22px auto;padding:clamp(22px,5vw,48px);background:radial-gradient(ellipse at 50% 0%,#ffffff12,transparent 65%),#17191d;border:1px solid #555960;text-align:center}.quote-text{font-size:clamp(22px,4vw,34px);line-height:1.55;color:#f0edf0;margin:28px auto;max-width:760px;font-family:Georgia,serif}.quote-meta{display:grid;gap:5px;color:#d7c7ce}.quote-meta strong{font-size:14px;letter-spacing:1px}.quote-meta span{font:12px Arial,sans-serif;color:var(--gold)}.quote-meta small{font:9px Arial,sans-serif;letter-spacing:2px;color:var(--muted)}.player-state{border-radius:0 3px 3px 0}.player-poster{padding:10px;border:1px solid var(--line);background:#15171b;border-radius:6px}.player-poster .ep-name{font-size:18px}.player-poster .eyebrow{margin-bottom:6px}.player-tools{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.server-select{background:#23252a;color:#eee5e8;border:1px solid #494c54;padding:9px 10px;border-radius:3px;max-width:100%;font:12px Arial,sans-serif}.player-state{font:12px/1.6 Arial,sans-serif;color:#cbb9c2;padding:10px 12px;background:#15171b;border-left:3px solid #9e304c;margin-top:10px}.player-poster{display:flex;gap:14px;align-items:center;margin-bottom:14px}.player-poster img{width:76px;height:108px;object-fit:cover;border:1px solid #704052;border-radius:3px}.player-poster .ep-name{font-size:17px;line-height:1.35}.server-chip{display:inline-block;padding:5px 9px;border:1px solid #5c3546;color:#d8a7b4;font:10px Arial,sans-serif;margin:3px;border-radius:20px}.player-placeholder{padding:45px 16px;text-align:center;color:var(--muted);font:13px/1.7 Arial,sans-serif}.source-link{display:inline-block;color:#e9b6c2;text-decoration:none;border-bottom:1px solid #8e4258;padding-bottom:2px;font:12px Arial,sans-serif;margin:12px 0}.source-link:hover{color:white}.notice{border:1px solid #795d3d;background:#281f17;color:#d6c09e;padding:12px 14px;border-radius:4px;font:12px/1.6 Arial,sans-serif;margin:12px 0}.error{border-color:#8c3347;background:#2b151d;color:#f0b5c1}.loading{padding:50px 15px;text-align:center;color:var(--gold);letter-spacing:3px}.loading:after{content:"";display:block;width:26px;height:26px;border:2px solid #663347;border-top-color:var(--red2);border-radius:50%;margin:15px auto 0;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.empty{padding:40px 15px;text-align:center;color:var(--muted);border:1px dashed #493340;border-radius:4px;font:13px Arial,sans-serif}.diagrow{display:grid;grid-template-columns:minmax(120px,1fr) 70px minmax(0,2fr);gap:10px;padding:10px;border-bottom:1px solid var(--line);font:12px Arial,sans-serif;align-items:center}.ok{color:#8ccea2}.bad{color:#e18b9b}.muted{color:var(--muted);font:11px Arial,sans-serif}.footer{margin-top:55px;padding:20px 0;border-top:1px solid var(--line);color:#7e6d77;font:10px/1.7 Arial,sans-serif;letter-spacing:.5px}
 @media(max-width:800px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px 12px;display:flex;gap:4px;overflow-x:auto}.side-label,.side-note{display:none}.navbtn{width:auto;min-width:max-content;padding:9px 12px;margin:0;font-size:12px}.navbtn .ico{width:auto;margin-right:5px}.main{padding-top:18px}.topbar{flex-wrap:wrap;gap:11px}.searchbar{order:3;max-width:none}.status{margin-left:auto}.hero{padding:21px 18px}.grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:11px}.detail-grid{grid-template-columns:120px minmax(0,1fr);gap:14px}.detail-poster{max-height:220px}.content-card{padding:13px}}
 @media(max-width:420px){.brandname{font-size:15px}.sigil{width:34px;height:34px}.detail-grid{grid-template-columns:1fr}.detail-poster{width:145px;max-height:220px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.diagrow{grid-template-columns:1fr 55px}.diagrow .diag-note{grid-column:1/-1}}
 .feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}.feature-tile{background:#24262b;border:1px solid #44474e;padding:16px;border-radius:5px}.feature-tile h3{margin:0 0 7px;font-weight:normal;color:#f0dce4}.feature-tile p{font:12px/1.55 Arial,sans-serif;color:var(--muted)}.field{background:#120e13;border:1px solid var(--line);color:var(--text);padding:10px;border-radius:3px;max-width:100%}.library-row{display:flex;gap:13px;align-items:center;padding:12px;border-bottom:1px solid var(--line)}.library-row img{width:58px;height:78px;object-fit:cover}.library-row .grow{flex:1;min-width:0}.library-row select,.library-row input{max-width:150px}.tool-panel{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.tool-panel textarea{width:100%;min-height:110px}.stat-number{font-size:25px;color:var(--gold)}
@@ -1835,9 +1967,9 @@ function showError(err){main.innerHTML=`<div class="hero"><div class="eyebrow">A
 async function loadTab(tab,btn=null){if(tab!=='home'&&activeHomeBannerUrl){URL.revokeObjectURL(activeHomeBannerUrl);activeHomeBannerUrl='';}if(tab!=='appearance'&&appearancePreviewUrl){URL.revokeObjectURL(appearancePreviewUrl);appearancePreviewUrl='';}currentTab=tab;backStack=[];setTabActive(tab);if(btn)setTabActive(tab);statusText.textContent='FETCHING · '+tab.toUpperCase();setLoading();try{
  if(tab==='home'){const d=await api('/api/home',40000);main.innerHTML=`<div class="hero" id="homeHero"><div class="hero-media" id="homeHeroMedia" aria-hidden="true"></div><div class="hero-shade"></div><div class="hero-content"><div class="eyebrow">THE MIDNIGHT ANIME INDEX</div><h1>Selamat datang di NOCTURNE</h1><p>APK streaming berbasis scraper dan API. Pilih poster untuk membuka detail judul dan daftar episode.</p></div></div>${sectionHead('Rilisan dari Beranda','LATEST FROM SOURCE')}${itemGrid(d.items)}`;applyHomeBanner();}
  else if(tab==='ongoing'){ongoingPage=1;await loadOngoing(1,false);}
- else if(tab==='anime-list'){const d=await api('/api/catalog?section=anime-list');main.innerHTML=`${sectionHead('Daftar Anime','A—Z INDEX')}<div class="toolbar"><span class="pill">${d.items.length} JUDUL TERBACA</span></div>${itemGrid(d.items)}`;}
+ else if(tab==='anime-list'){const d=await api('/api/catalog?section=anime-list',30000);renderAnimeList(d);}
  else if(tab==='schedule'){const d=await api('/api/schedule');main.innerHTML=`${sectionHead('Jadwal Rilis','WEEKLY SCHEDULE')}${d.groups?.length?d.groups.map(g=>`<h3 class="daytitle">☾ ${esc(g.day)}</h3><div class="list">${g.items.map(x=>`<button class="listbtn" onclick="openAnime(decodeURIComponent('${jsArg(x.url)}'))">✧ &nbsp;${esc(x.title)}</button>`).join('')}</div>`).join(''):'<div class="empty">Jadwal tidak ditemukan.</div>'}`;}
- else if(tab==='genres'){const d=await api('/api/genres');main.innerHTML=`${sectionHead('Genre','CHOOSE YOUR MOOD')}<div class="grid">${d.genres.map(g=>`<article class="card" onclick="openGenre(decodeURIComponent('${jsArg(g.url)}'))"><div class="poster" style="aspect-ratio:1.35/1"><div class="noimg">❖</div></div><div class="cardbody"><div class="cardtitle">${esc(g.title)}</div><div class="cardsub">EXPLORE GENRE</div></div></article>`).join('')}</div>`;}
+ else if(tab==='genres'){const d=await api('/api/genres',25000);renderGenreList(d);}
  else if(tab==='mal'){renderMalSearch();}
  else if(tab==='multiverse'){renderMultiverseSearch();}
  else if(tab==='discover'){await loadMultiverseDiscover();}
@@ -1856,6 +1988,35 @@ async function loadTab(tab,btn=null){if(tab!=='home'&&activeHomeBannerUrl){URL.r
  else if(tab==='diagnose'){await loadDiagnostics();}
  }catch(e){showError(e);}finally{statusText.textContent='SHADOW INDEX · '+(tab==='diagnose'?'DIAGNOSTICS':'CONNECTED');}}
 
+function renderAnimeList(d){
+ const groups=Array.isArray(d.groups)?d.groups:[];
+ const safeGroups=groups.map((g,i)=>({label:String(g.label||'#'),items:Array.isArray(g.items)?g.items:[],id:'animeGroup'+i})).filter(g=>g.items.length);
+ const index=safeGroups.map(g=>`<a href="#${g.id}" aria-label="Lompat ke ${esc(g.label)}">${esc(g.label)}</a>`).join('');
+ const sections=safeGroups.map(g=>`<section class="anime-group" id="${g.id}" data-letter="${esc(g.label)}"><div class="anime-group-head"><h3>${esc(g.label)}</h3><span>${g.items.length} JUDUL</span></div><div class="anime-rows">${g.items.map(x=>`<button class="anime-row" type="button" data-title="${esc(x.title)}" onclick="openAnime(decodeURIComponent('${jsArg(x.url)}'))">${esc(x.title)}</button>`).join('')}</div></section>`).join('');
+ main.innerHTML=`${sectionHead('Daftar Anime','OTAKUDESU · ALPHABETICAL INDEX')}<div class="genre-tools"><span class="pill">${Number(d.total||d.items?.length||0)} JUDUL</span><span class="muted">Tampilan daftar teks seperti halaman sumber</span></div><input class="field anime-filter" id="animeListFilter" type="search" placeholder="Cari judul anime..." autocomplete="off"><nav class="anime-index" aria-label="Indeks huruf">${index}</nav><div id="animeListSections">${sections||'<div class="empty">Daftar anime tidak berhasil dibaca dari halaman sumber.</div>'}</div><div class="notice">Daftar ini dibaca dari halaman publik OtakuDesu Anime List. Pilih judul untuk membuka detail dan episode.</div>`;
+ const input=document.getElementById('animeListFilter');
+ input.addEventListener('input',()=>{const q=input.value.trim().toLocaleLowerCase();let visible=0;document.querySelectorAll('#animeListSections .anime-group').forEach(group=>{let count=0;group.querySelectorAll('.anime-row').forEach(row=>{const match=!q||row.dataset.title.toLocaleLowerCase().includes(q);row.style.display=match?'flex':'none';if(match)count++;});group.style.display=count?'block':'none';const counter=group.querySelector('.anime-group-head span');if(counter)counter.textContent=count+' JUDUL';visible+=count;});document.querySelectorAll('.anime-index a').forEach(link=>{const target=document.querySelector(link.getAttribute('href'));link.style.display=target&&target.style.display!=='none'?'':'none';});let status=document.getElementById('animeFilterStatus');if(status)status.textContent=visible+' judul cocok';});
+ const tools=document.querySelector('.genre-tools');if(tools){const span=document.createElement('span');span.id='animeFilterStatus';span.className='muted';span.textContent='';tools.appendChild(span);}
+}
+function renderGenreList(d){
+ const genres=(Array.isArray(d.genres)?d.genres:[]).filter(g=>g&&g.title&&g.url);
+ main.innerHTML=`${sectionHead('Genre Anime','OTAKUDESU · GENRE INDEX')}<div class="genre-tools"><span class="pill">${genres.length} GENRE</span><span class="muted">Pilih genre untuk melihat daftar anime.</span></div><input class="field anime-filter" id="genreFilter" type="search" placeholder="Cari genre..." autocomplete="off"><div class="genre-cloud" id="genreCloud">${genres.map(g=>`<button class="genre-chip" type="button" data-genre="${esc(g.title.toLocaleLowerCase())}" onclick="openGenre(decodeURIComponent('${jsArg(g.url)}'))">${esc(g.title)}</button>`).join('')}</div><div class="empty" id="genreNoResults" style="display:none">Genre tidak ditemukan.</div><div class="notice">Daftar genre dibaca dari halaman publik OtakuDesu Genre List.</div>`;
+ const input=document.getElementById('genreFilter');input.addEventListener('input',()=>{const q=input.value.trim().toLocaleLowerCase();let count=0;document.querySelectorAll('#genreCloud .genre-chip').forEach(chip=>{const match=!q||chip.dataset.genre.includes(q);chip.style.display=match?'inline-flex':'none';if(match)count++;});document.getElementById('genreNoResults').style.display=count?'none':'block';});
+}
+function closeWallpaperPreview(){const old=document.getElementById('wallpaperLightbox');if(old)old.remove();document.body.style.overflow='';}
+function openWallpaperPreview(url,title,source){
+ if(!/^https:\/\//i.test(url)){alert('URL gambar tidak valid.');return;}
+ closeWallpaperPreview();
+ const overlay=document.createElement('div');overlay.className='wallpaper-lightbox';overlay.id='wallpaperLightbox';
+ const filename=(String(title||'NOCTURNE-wallpaper').normalize('NFKD').replace(/[^A-Za-z0-9_-]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64)||'NOCTURNE-wallpaper')+'.jpg';
+ const downloadUrl='/api/wallpapers/download?url='+encodeURIComponent(url)+'&name='+encodeURIComponent(filename.replace(/\.jpg$/i,''));
+ overlay.innerHTML=`<button class="wallpaper-lightbox-close" type="button" aria-label="Tutup" onclick="closeWallpaperPreview()">×</button><div class="wallpaper-lightbox-inner"><img src="${esc(url)}" alt="${esc(title)}" referrerpolicy="no-referrer"><div class="wallpaper-lightbox-error" style="display:none">Gambar tidak dapat ditampilkan dari sumber. Coba wallpaper lain.</div><div class="wallpaper-lightbox-bar"><div class="wallpaper-lightbox-title">${esc(title||'Anime wallpaper')}</div><a class="action primary" href="${downloadUrl}" download="${esc(filename)}">↓ Download wallpaper</a><a class="action" href="${esc(source||'https://www.pinterest.com/')}" target="_blank" rel="noopener noreferrer">Sumber ↗</a><button class="action" type="button" onclick="closeWallpaperPreview()">Tutup</button></div></div>`;
+ overlay.addEventListener('click',event=>{if(event.target===overlay)closeWallpaperPreview();});
+ const image=overlay.querySelector('img');image.addEventListener('error',()=>{image.style.display='none';overlay.querySelector('.wallpaper-lightbox-error').style.display='block';});
+ document.body.appendChild(overlay);document.body.style.overflow='hidden';
+}
+document.addEventListener('keydown',event=>{if(event.key==='Escape')closeWallpaperPreview();});
+
 async function renderAnimeWallpapers(query=''){
  main.innerHTML=`<div class="hero"><div class="eyebrow">NOCTURNE · VISUAL ARCHIVE</div><h1>Anime Wallpapers</h1><p>Cari wallpaper karakter anime melalui Pinterest. Hasil gambar ditampilkan dari URL provider, dengan tautan sumber jika tersedia.</p></div><form class="toolbar" id="wallpaperSearchForm"><input class="field" id="wallpaperQuery" style="flex:1;min-width:170px" maxlength="80" placeholder="Contoh: Naruto, Frieren, Gojo..." value="${esc(query)}"><button class="action primary">Cari Wallpaper</button><button class="action" type="button" id="wallpaperRefresh">Acak Ulang</button></form><div id="wallpaperResults"><div class="loading">MEMANGGIL GALERI VISUAL</div></div><div class="notice">Sumber: Bintang API → Pinterest. Gunakan kata kunci aman. Hak cipta gambar tetap milik pemilik aslinya; NOCTURNE hanya menampilkan hasil dan atribusi yang tersedia.</div>`;
  const form=document.getElementById('wallpaperSearchForm');
@@ -1867,8 +2028,8 @@ async function loadAnimeWallpapers(query='anime wallpaper',refresh=false){
  const box=document.getElementById('wallpaperResults');if(!box)return;box.innerHTML='<div class="loading">MENGAMBIL HASIL PINTEREST</div>';
  try{
   const d=await api('/api/wallpapers?count=12&q='+encodeURIComponent(query)+(refresh?'&refresh=1':''),24000);
-  const cards=(d.items||[]).map(x=>`<article class="card"><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer" style="display:block;text-decoration:none;color:inherit"><div class="poster" style="aspect-ratio:3/4;background:#101115"><img loading="lazy" referrerpolicy="no-referrer" src="${esc(x.thumbnail||x.url)}" alt="${esc(x.title||'Anime wallpaper')}" onerror="this.style.display='none';this.parentElement.innerHTML='<div class=\'noimg\'>IMAGE UNAVAILABLE</div>'"></div></a><div class="cardbody"><div class="cardtitle">${esc(x.title||'Anime wallpaper')}</div><div class="cardsub">PINTEREST · <a href="${esc(x.source_url||'https://www.pinterest.com/')}" target="_blank" rel="noopener noreferrer" style="color:#d8a7b4">SUMBER</a></div></div></article>`).join('');
-  box.innerHTML=`<div class="toolbar"><span class="pill">${(d.items||[]).length} WALLPAPERS</span><span class="pill">${esc(d.provider||'Bintang API · Pinterest')}</span></div>${cards?`<div class="grid">${cards}</div>`:'<div class="empty">Belum ada wallpaper untuk kata kunci ini.</div>'}`;
+  const cards=(d.items||[]).map(x=>`<article class="card wallpaper-card"><img class="wallpaper-thumb" loading="lazy" referrerpolicy="no-referrer" src="${esc(x.thumbnail||x.url)}" alt="${esc(x.title||'Anime wallpaper')}" onclick="openWallpaperPreview(decodeURIComponent('${jsArg(x.url)}'),decodeURIComponent('${jsArg(x.title||'Anime wallpaper')}'),decodeURIComponent('${jsArg(x.source_url||'https://www.pinterest.com/')}'))" onerror="this.style.opacity='.25';this.alt='Gambar tidak tersedia'"><div class="cardbody"><div class="cardtitle">${esc(x.title||'Anime wallpaper')}</div><div class="wallpaper-actions"><button class="action" type="button" onclick="openWallpaperPreview(decodeURIComponent('${jsArg(x.url)}'),decodeURIComponent('${jsArg(x.title||'Anime wallpaper')}'),decodeURIComponent('${jsArg(x.source_url||'https://www.pinterest.com/')}'))">Lihat</button><a class="action" href="/api/wallpapers/download?url=${encodeURIComponent(x.url)}&amp;name=${encodeURIComponent(String(x.title||'NOCTURNE-wallpaper').replace(/[^A-Za-z0-9_-]+/g,'_').slice(0,50)||'NOCTURNE-wallpaper')}" download="${esc((String(x.title||'NOCTURNE-wallpaper').replace(/[^A-Za-z0-9_-]+/g,'_').slice(0,50)||'NOCTURNE-wallpaper')+'.jpg')}">↓ Simpan</a></div><div class="cardsub">PINTEREST · <a href="${esc(x.source_url||'https://www.pinterest.com/')}" target="_blank" rel="noopener noreferrer" style="color:#d8a7b4">SUMBER</a></div></div></article>`).join('');
+  box.innerHTML=`<div class="toolbar"><span class="pill">${(d.items||[]).length} WALLPAPERS</span><span class="pill">${esc(d.provider||'Bintang API · Pinterest')}</span><span class="muted">Ketuk gambar untuk pratinjau layar penuh.</span></div>${cards?`<div class="grid">${cards}</div>`:'<div class="empty">Belum ada wallpaper untuk kata kunci ini.</div>'}`;
  }catch(e){box.innerHTML=`<div class="notice error">Wallpaper belum dapat dimuat: ${esc(e.message||e)}<br>Periksa koneksi atau coba kata kunci anime lain.</div>`;}
 }
 
@@ -1953,7 +2114,7 @@ async function loadProviderStatus(){
 
 async function loadOngoing(page,append){const d=await api(`/api/catalog?section=ongoing&page=${page}`);ongoingPage=page;if(!append)main.innerHTML=`${sectionHead('Anime Ongoing','CURRENTLY AIRING')}<div id="ongoingGrid">${itemGrid(d.items)}</div><div class="toolbar" style="margin-top:18px"><button class="action" onclick="loadOngoing(${Math.max(1,page-1)},false)" ${page<=1?'disabled':''}>← Sebelumnya</button><span class="pill">PAGE ${page}</span><button class="action" onclick="loadOngoing(${page+1},false)">Berikutnya →</button></div>`;else{} }
 async function openGenre(url){rememberCurrent();setLoading('MEMBACA GENRE');try{const d=await api('/api/genre?url='+encodeURIComponent(url));main.innerHTML=`<div class="toolbar"><button class="action" onclick="goBack()">← Kembali</button></div>${sectionHead(d.title,'GENRE INDEX')}${itemGrid(d.items)}`;}catch(e){showError(e);}}
-async function openAnime(url){rememberCurrent();setLoading('MEMBACA DETAIL ANIME');try{const d=await api('/api/anime?url='+encodeURIComponent(url));const meta=Object.entries(d.meta||{}).slice(0,18).map(([k,v])=>`<div><b>${esc(k)}</b>${esc(v)}</div>`).join('');main.innerHTML=`<div class="toolbar"><button class="action" onclick="goBack()">← Kembali</button><a class="source-link" target="_blank" rel="noopener noreferrer" href="${esc(d.url)}">Buka halaman asli ↗</a></div><section class="content-card"><div class="detail-grid"><div>${d.image?`<img class="detail-poster" loading="lazy" referrerpolicy="no-referrer" src="${esc(d.image)}" alt="${esc(d.title)}">`:'<div class="poster detail-poster noimg">✧</div>'}</div><div><div class="eyebrow">ANIME DOSSIER</div><h1 class="detail-title">${esc(d.title)}</h1><div class="toolbar">${(d.genres||[]).map(g=>`<span class="pill">${esc(g.title)}</span>`).join('')}</div><div class="meta">${meta||'<div>Detail belum tersedia di halaman ini.</div>'}</div><p class="desc">${esc(d.description||'')}</p><div class="toolbar" style="margin-top:14px"><button class="action primary" onclick="lookupMal('${jsArg(d.title)}')">✥ Cari informasi MyAnimeList</button></div><div id="malMatch"></div></div></div></section>${sectionHead('Daftar Episode','STREAMING EPISODES')}<div class="list">${(d.episodes||[]).length?d.episodes.map(ep=>`<button class="listbtn" onclick="openEpisode(decodeURIComponent('${jsArg(ep.url)}'))">▶ &nbsp;${esc(ep.title)}</button>`).join(''):'<div class="empty">Daftar episode tidak berhasil dibaca. Buka halaman asli untuk melihat struktur terbaru.</div>'}</div>`;}catch(e){showError(e);}}
+async function openAnime(url){rememberCurrent();setLoading('MEMBACA DETAIL ANIME');try{const d=await api('/api/anime?url='+encodeURIComponent(url));const meta=Object.entries(d.meta||{}).slice(0,18).map(([k,v])=>`<div><b>${esc(k)}</b>${esc(v)}</div>`).join('');main.innerHTML=`<div class="toolbar"><button class="action" onclick="goBack()">← Kembali</button></div><section class="content-card"><div class="detail-grid"><div>${d.image?`<img class="detail-poster" loading="lazy" referrerpolicy="no-referrer" src="${esc(d.image)}" alt="${esc(d.title)}">`:'<div class="poster detail-poster noimg">✧</div>'}</div><div><div class="eyebrow">ANIME DOSSIER</div><h1 class="detail-title">${esc(d.title)}</h1><div class="toolbar">${(d.genres||[]).map(g=>`<span class="pill">${esc(g.title)}</span>`).join('')}</div><div class="meta">${meta||'<div>Detail belum tersedia di halaman ini.</div>'}</div><p class="desc">${esc(d.description||'')}</p><div class="toolbar" style="margin-top:14px"><button class="action primary" onclick="lookupMal('${jsArg(d.title)}')">✥ Cari informasi MyAnimeList</button></div><div id="malMatch"></div></div></div></section>${sectionHead('Daftar Episode','STREAMING EPISODES')}<div class="list">${(d.episodes||[]).length?d.episodes.map(ep=>`<button class="listbtn" onclick="openEpisode(decodeURIComponent('${jsArg(ep.url)}'))">▶ &nbsp;${esc(ep.title)}</button>`).join(''):'<div class="empty">Daftar episode tidak berhasil dibaca. Buka halaman asli untuk melihat struktur terbaru.</div>'}</div>`;}catch(e){showError(e);}}
 function renderMalSearch(){main.innerHTML=`<div class="hero"><div class="eyebrow">MYANIMELIST · PUBLIC CATALOGUE</div><h1>Anime dossier & knowledge archive</h1><p>Cari judul untuk melihat sinopsis, skor komunitas, peringkat, studio, produser, tema, karakter, staf, rekomendasi, dan statistik dari katalog publik MyAnimeList.</p></div><div class="toolbar"><span class="pill">PROVIDER · TENRAI API</span><button class="action" onclick="checkMalStatus()">◈ Tes koneksi MAL</button></div><div id="malProviderStatus" class="notice">Provider metadata menggunakan Tenrai API. Pengecekan koneksi tersedia di tombol ini.</div><form class="toolbar" id="malSearchForm"><input class="server-select" id="malQuery" style="flex:1;min-width:180px" placeholder="Cari judul anime di MyAnimeList..." required><button class="action primary">Cari MAL</button></form><div id="malResults"><div class="empty">Masukkan judul anime untuk mencari di katalog MyAnimeList.</div></div><div class="notice">Metadata MyAnimeList publik disediakan melalui Tenrai API (kompatibel dengan format Jikan v4). Layanan pihak ketiga dapat berubah atau mengalami gangguan; setiap request memiliki batas waktu dan pesan error yang jelas.</div>`;document.getElementById('malSearchForm').addEventListener('submit',async e=>{e.preventDefault();await searchMal(document.getElementById('malQuery').value);});}
 async function checkMalStatus(){const box=document.getElementById('malProviderStatus');if(!box)return;box.innerHTML='<span class="loading">MEMERIKSA KONEKSI TENRAI...</span>';try{const d=await api('/api/mal/status',14000);box.innerHTML=`<span class="pill">ONLINE</span> Provider ${esc(d.provider)} · ${Number(d.elapsed_ms)} ms · ${Number(d.sample_count)} contoh hasil.`;}catch(e){box.innerHTML=`<div class="notice error"><b>Provider belum dapat dihubungi.</b><br>${esc(e.message)}<br><small>Provider: Tenrai API</small></div>`;}}
 async function searchMal(q){const box=document.getElementById('malResults');if(!box)return;box.innerHTML='<div class="loading">MENCARI DI MYANIMELIST</div>';try{const d=await api('/api/mal/search?q='+encodeURIComponent(q));box.innerHTML=sectionHead('Hasil MyAnimeList','TENRAI · MAL CATALOGUE')+(d.items.length?`<div class="grid">${d.items.map(x=>`<article class="card" onclick="openMal(${Number(x.mal_id)})"><div class="poster">${x.image?`<img loading="lazy" src="${esc(x.image)}" referrerpolicy="no-referrer" alt="${esc(x.title)}">`:'<div class="noimg">✧</div>'}</div><div class="cardbody"><div class="cardtitle">${esc(x.title)}</div><div class="cardsub">${x.score?'★ '+esc(x.score):'NO SCORE'} · ${esc(x.year||x.type||'MAL')}</div></div></article>`).join('')}</div>`:'<div class="empty">Tidak ada hasil.</div>');}catch(e){box.innerHTML=`<div class="notice error">${esc(e.message)}</div>`;}}

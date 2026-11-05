@@ -39,6 +39,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install parser test dependency
+        run: python -m pip install beautifulsoup4==4.14.2
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
@@ -75,7 +78,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: NOCTURNE-4.2-debug-APK
+          name: NOCTURNE-4.3-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14

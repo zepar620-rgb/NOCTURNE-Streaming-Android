@@ -1,6 +1,6 @@
 # Provider reference
 
-NOCTURNE 4.2 uses these third-party catalogue and media services:
+NOCTURNE 4.3 uses these third-party catalogue and media services:
 
 - Tenrai API (MyAnimeList-compatible metadata): https://api.tenrai.org/documentation
 - AniList GraphQL: https://docs.anilist.co/guide/graphql/

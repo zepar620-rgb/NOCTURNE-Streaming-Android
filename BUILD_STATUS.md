@@ -1,11 +1,9 @@
-# Build status — NOCTURNE 4.2
+# Build status — NOCTURNE 4.3.0
 
-- Added Bintang API Pinterest wallpaper search through the local Flask proxy.
-- Added Bintang API OtakuDesu stream metadata, resolution selector, and server selector.
-- Added Animechan random character quote screen.
-- Replaced launcher artwork with the supplied monochrome luminous logo across adaptive/raster Android icon assets.
-- Added a rotating/pulsing animated native splash mark and matching WebView header/login branding.
-- GitHub Actions checks Python compilation, feature helper tests and inline JavaScript syntax before building the debug APK.
+- Anime List menggunakan parser struktur heading dan link dari `https://otakudesu.blog/anime-list/`, lalu disajikan dalam daftar vertikal per kelompok.
+- Genre menggunakan `https://otakudesu.blog/genre-list/`, disajikan sebagai chip inline berderet dengan filter lokal.
+- Wallpaper dibuka di pratinjau fullscreen dalam aplikasi; tombol download memakai endpoint gambar terbatas ke Pinterest CDN dan validasi MIME/ukuran.
+- Fitur 4.2 (Bintang Pinterest, pilihan resolusi/server streaming, Anime Quotes, ikon launcher, dan animasi splash) dipertahankan.
+- Source checks: Python compile, parser/media unit tests, and inline JavaScript syntax checks.
 - A complete Android Gradle build must still be confirmed by a successful GitHub Actions run or a local Android SDK build.
-
-External Bintang API endpoints could not be live-verified in the current build environment. Unit checks use representative response shapes; run on-device provider tests after deployment.
+- Live OtakuDesu/Bintang API behavior depends on the user's network and upstream site. The build environment could not reach `otakudesu.blog`; no live success is claimed.
