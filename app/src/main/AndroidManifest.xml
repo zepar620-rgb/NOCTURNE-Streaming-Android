@@ -6,9 +6,9 @@
     <application
         android:name="com.chaquo.python.android.PyApplication"
         android:allowBackup="true"
-        android:icon="@drawable/ic_nocturne"
+        android:icon="@mipmap/ic_nocturne"
         android:label="NOCTURNE: Streaming Anime"
-        android:roundIcon="@drawable/ic_nocturne"
+        android:roundIcon="@mipmap/ic_nocturne_round"
         android:supportsRtl="true"
         android:theme="@style/NocturneTheme"
         android:usesCleartextTraffic="true">

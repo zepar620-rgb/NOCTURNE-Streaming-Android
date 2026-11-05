@@ -1,4 +1,4 @@
-# Upload NOCTURNE 4.1 to GitHub from Termux
+# Upload NOCTURNE 4.2 to GitHub from Termux
 
 ## 1. Create an empty GitHub repository
 
@@ -6,14 +6,14 @@ On GitHub, create a repository (for example `NOCTURNE-Streaming-Android`). Do no
 
 ## 2. Extract and initialize the project in Termux
 
-Download `NOCTURNE_STREAMING_4_1_ANDROID.zip` to the Android `Download` folder first. Then run: 
+Download `NOCTURNE-Streaming-Android-4.2.0.zip` to the Android `Download` folder first. Then run:
 
 ```bash
 pkg update -y && pkg install -y git unzip
 termux-setup-storage
 mkdir -p ~/projects
-unzip -o /sdcard/Download/NOCTURNE_STREAMING_4_1_ANDROID.zip -d ~/projects
-cd ~/projects/NOCTURNE_STREAMING_4_1_ANDROID
+unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.2.0.zip -d ~/projects
+cd ~/projects/NOCTURNE-Streaming-Android
 
 # Set these to your GitHub account details
 git config --global user.name "YOUR_GITHUB_USERNAME"
@@ -21,7 +21,7 @@ git config --global user.email "YOUR_GITHUB_EMAIL"
 
 git init -b main
 git add .
-git commit -m "NOCTURNE 4.1 Android project"
+git commit -m "NOCTURNE 4.2 Android project"
 
 # Replace the URL with your own empty GitHub repository URL
 git remote add origin https://github.com/YOUR_GITHUB_USERNAME/NOCTURNE-Streaming-Android.git
@@ -36,11 +36,11 @@ When Git asks for credentials, enter your GitHub username. For the password prom
 
 ## 4. Download the APK from GitHub Actions
 
-After the push succeeds, open the repository on GitHub → **Actions** → **Build NOCTURNE Android APK**. Open the latest successful run and download the artifact named `NOCTURNE-4.1-debug-APK` from the **Artifacts** section. Extract that artifact ZIP to get `app-debug.apk`. You can also start a build manually from **Actions → Build NOCTURNE Android APK → Run workflow**.
+After the push succeeds, open the repository on GitHub → **Actions** → **Build NOCTURNE Android APK**. Open the latest successful run and download the artifact named `NOCTURNE-4.2-debug-APK` from the **Artifacts** section. Extract that artifact ZIP to get `app-debug.apk`. You can also start a build manually from **Actions → Build NOCTURNE Android APK → Run workflow**.
 
 ## 5. Push later changes
 
-Whenever you edit the project, run these commands from the project directory: 
+Whenever you edit the project, run these commands from the project directory:
 
 ```bash
 git add .
@@ -49,3 +49,5 @@ git push
 ```
 
 A push to `main` starts the workflow automatically. The artifact contains a **debug APK** for testing; it is not a Play Store release-signed APK.
+
+For an existing checkout, see [`UPDATE_TERMUX.md`](UPDATE_TERMUX.md) for the update/commit/push procedure.

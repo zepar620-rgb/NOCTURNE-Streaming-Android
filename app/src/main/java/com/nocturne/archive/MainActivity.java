@@ -3,6 +3,9 @@ package com.nocturne.archive;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.animation.AnimatorSet;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
@@ -25,6 +28,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -37,6 +41,7 @@ import org.json.JSONObject;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import android.view.animation.LinearInterpolator;
 
 /** Android shell which runs the complete Python/Flask NOCTURNE streaming anime app locally. */
 public class MainActivity extends Activity {
@@ -49,6 +54,8 @@ public class MainActivity extends Activity {
     private LinearLayout loadingPanel;
     private TextView loadingText;
     private ProgressBar progressBar;
+    private ImageView loadingLogo;
+    private AnimatorSet loadingAnimator;
     private ValueCallback<Uri[]> filePathCallback;
     private ExecutorService startupExecutor;
     private View fullscreenView;
@@ -71,6 +78,24 @@ public class MainActivity extends Activity {
         startLocalPythonServer();
     }
 
+    @Override
+    protected void onRestart() {
+        super.onRestart();
+        if (loadingPanel == null || webView == null) return;
+        loadingText.setText("MEMANGGIL ARSIP NOCTURNE...");
+        loadingPanel.setVisibility(View.VISIBLE);
+        startLoadingAnimation();
+        if (webView.getProgress() >= 100) {
+            loadingPanel.postDelayed(() -> {
+                if (!isFinishing() && loadingPanel != null
+                        && loadingPanel.getVisibility() == View.VISIBLE) {
+                    loadingPanel.setVisibility(View.GONE);
+                    stopLoadingAnimation();
+                }
+            }, 850);
+        }
+    }
+
     private void buildLayout() {
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.rgb(16, 17, 19));
@@ -87,10 +112,20 @@ public class MainActivity extends Activity {
         loadingPanel.setPadding(dp(28), dp(28), dp(28), dp(28));
         loadingPanel.setBackgroundColor(Color.rgb(16, 17, 19));
 
+        loadingLogo = new ImageView(this);
+        loadingLogo.setImageResource(com.nocturne.archive.R.mipmap.ic_nocturne_foreground);
+        loadingLogo.setContentDescription("Logo NOCTURNE");
+        loadingLogo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(dp(132), dp(132));
+        logoParams.bottomMargin = dp(14);
+        loadingPanel.addView(loadingLogo, logoParams);
+        startLoadingAnimation();
+
         TextView mark = new TextView(this);
-        mark.setText("✠  N O C T U R N E  ✠");
-        mark.setTextColor(Color.rgb(220, 191, 207));
-        mark.setTextSize(21);
+        mark.setText("N O C T U R N E");
+        mark.setTextColor(Color.rgb(239, 239, 242));
+        mark.setTextSize(22);
+        mark.setLetterSpacing(0.18f);
         mark.setGravity(Gravity.CENTER);
         loadingPanel.addView(mark);
 
@@ -123,6 +158,36 @@ public class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
         setContentView(root);
+    }
+
+    private void startLoadingAnimation() {
+        if (loadingLogo == null) return;
+        if (loadingAnimator != null) loadingAnimator.cancel();
+        ObjectAnimator rotation = ObjectAnimator.ofFloat(loadingLogo, View.ROTATION, 0f, 360f);
+        rotation.setDuration(5600);
+        rotation.setRepeatCount(ValueAnimator.INFINITE);
+        rotation.setInterpolator(new LinearInterpolator());
+        ObjectAnimator pulseX = ObjectAnimator.ofFloat(loadingLogo, View.SCALE_X, 0.94f, 1.04f, 0.94f);
+        ObjectAnimator pulseY = ObjectAnimator.ofFloat(loadingLogo, View.SCALE_Y, 0.94f, 1.04f, 0.94f);
+        pulseX.setDuration(1900);
+        pulseY.setDuration(1900);
+        pulseX.setRepeatCount(ValueAnimator.INFINITE);
+        pulseY.setRepeatCount(ValueAnimator.INFINITE);
+        loadingAnimator = new AnimatorSet();
+        loadingAnimator.playTogether(rotation, pulseX, pulseY);
+        loadingAnimator.start();
+    }
+
+    private void stopLoadingAnimation() {
+        if (loadingAnimator != null) {
+            loadingAnimator.cancel();
+            loadingAnimator = null;
+        }
+        if (loadingLogo != null) {
+            loadingLogo.setRotation(0f);
+            loadingLogo.setScaleX(1f);
+            loadingLogo.setScaleY(1f);
+        }
     }
 
     private void configureWebView(WebView target, boolean mainWindow) {
@@ -175,6 +240,7 @@ public class MainActivity extends Activity {
                 public void onPageFinished(WebView view, String url) {
                     super.onPageFinished(view, url);
                     loadingPanel.setVisibility(View.GONE);
+                    stopLoadingAnimation();
                 }
 
                 @Override
@@ -183,6 +249,7 @@ public class MainActivity extends Activity {
                     super.onReceivedError(view, request, error);
                     if (request.isForMainFrame() && loadingPanel.getVisibility() == View.VISIBLE) {
                         loadingText.setText("HALAMAN GAGAL DIMUAT. PERIKSA KONEKSI, LALU COBA LAGI.");
+                        stopLoadingAnimation();
                     }
                 }
             });
@@ -265,6 +332,7 @@ public class MainActivity extends Activity {
     }
 
     private void showStartupError(Throwable error) {
+        stopLoadingAnimation();
         loadingPanel.removeAllViews();
         TextView title = new TextView(this);
         title.setText("NOCTURNE TIDAK DAPAT DIMULAI");
@@ -396,6 +464,7 @@ public class MainActivity extends Activity {
         public void onProgressChanged(WebView view, int newProgress) {
             if (view == webView && newProgress == 100 && loadingPanel.getVisibility() == View.VISIBLE) {
                 loadingPanel.setVisibility(View.GONE);
+                stopLoadingAnimation();
             }
         }
     }
@@ -507,6 +576,7 @@ public class MainActivity extends Activity {
     }
 
     protected void onDestroy() {
+        stopLoadingAnimation();
         if (startupExecutor != null) startupExecutor.shutdownNow();
         if (webView != null) {
             webView.stopLoading();

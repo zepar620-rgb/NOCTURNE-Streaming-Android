@@ -1,13 +1,11 @@
-# Build status — NOCTURNE 4.1
+# Build status — NOCTURNE 4.2
 
-- Added GitHub Actions build pipeline: `.github/workflows/build-apk.yml`.
-- CI verifies Python syntax, runs offline provider/branding tests, checks inline JavaScript syntax, and runs `:app:assembleDebug`.
-- CI toolchain: JDK 17, Python 3.11, Node 22, Android SDK Platform 36 / Build Tools 36.0.0, Gradle 8.13.
-- Added separate home appearance settings for animated MP4/GIF banners; blobs are stored in IndexedDB.
-- Profile banner is now independent and does not affect the home hero.
-- Android file picker now uses each HTML input's MIME accept types.
-- A complete Android build still needs to be confirmed by the first GitHub Actions run.
+- Added Bintang API Pinterest wallpaper search through the local Flask proxy.
+- Added Bintang API OtakuDesu stream metadata, resolution selector, and server selector.
+- Added Animechan random character quote screen.
+- Replaced launcher artwork with the supplied monochrome luminous logo across adaptive/raster Android icon assets.
+- Added a rotating/pulsing animated native splash mark and matching WebView header/login branding.
+- GitHub Actions checks Python compilation, feature helper tests and inline JavaScript syntax before building the debug APK.
+- A complete Android Gradle build must still be confirmed by a successful GitHub Actions run or a local Android SDK build.
 
-- Added `docs/GITHUB_TERMUX.md` with repository setup, PAT authentication guidance, push commands, and artifact download instructions.
-
-- NOCTURNE 4.1.1: bundled animated home banner added (CSS motion over local banner artwork); no upload required for the default animation.
+External Bintang API endpoints could not be live-verified in the current build environment. Unit checks use representative response shapes; run on-device provider tests after deployment.
