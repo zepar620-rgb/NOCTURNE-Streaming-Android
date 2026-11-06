@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
 import json
@@ -27,7 +28,7 @@ from urllib.parse import quote, urljoin, urlparse, urlencode
 
 import requests
 from bs4 import BeautifulSoup, Tag
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import Flask, g, jsonify, render_template_string, request, send_file
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -124,7 +125,104 @@ _api_session = requests.Session()
 _api_adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, status=0, redirect=0, allowed_methods=frozenset(("GET", "POST"))))
 _api_session.mount("https://", _api_adapter)
 _api_session.mount("http://", _api_adapter)
-_api_session.headers.update({"User-Agent": "NOCTURNE/4.0 (public anime metadata client)", "Accept": "application/json, application/xml;q=0.9, text/xml;q=0.8"})
+_api_session.headers.update({"User-Agent": "NOCTURNE/4.4 (NOCTURNE Android; personal archive)", "Accept": "application/json, application/xml;q=0.9, text/xml;q=0.8"})
+
+# Lightweight in-process traffic telemetry. Counts response-body bytes observed by
+# Requests and Flask, not lower-level TCP/TLS framing or Android radio overhead.
+_telemetry_lock = threading.Lock()
+_telemetry_started = time.monotonic()
+_telemetry = {
+    "upstream_bytes": 0, "upstream_requests": 0,
+    "app_tx_bytes": 0, "app_rx_bytes": 0, "app_requests": 0,
+    "last_upstream_ms": None, "last_http_event": None,
+}
+_telemetry_events = deque(maxlen=24)
+_telemetry_snapshot = {"at": time.monotonic(), "upstream_bytes": 0, "app_tx_bytes": 0, "app_rx_bytes": 0}
+
+
+def _telemetry_response_hook(response, *args, **kwargs):
+    try:
+        body_bytes = len(response.content or b"")
+    except Exception:
+        body_bytes = int(response.headers.get("Content-Length", 0) or 0)
+    try:
+        elapsed_ms = round(response.elapsed.total_seconds() * 1000, 1)
+    except Exception:
+        elapsed_ms = None
+    parsed = urlparse(response.url)
+    event = {
+        "host": parsed.hostname or "unknown", "status": int(response.status_code),
+        "bytes": max(0, body_bytes), "elapsed_ms": elapsed_ms,
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    with _telemetry_lock:
+        _telemetry["upstream_bytes"] += event["bytes"]
+        _telemetry["upstream_requests"] += 1
+        _telemetry["last_upstream_ms"] = elapsed_ms
+        _telemetry["last_http_event"] = event
+        _telemetry_events.appendleft(event)
+    return response
+
+
+for _tracked_session in (_session, _api_session, _mal_session):
+    _tracked_session.hooks.setdefault("response", []).append(_telemetry_response_hook)
+
+
+@app.before_request
+def _telemetry_request_start():
+    if request.path != "/api/telemetry":
+        g.nocturne_request_started = time.monotonic()
+        g.nocturne_request_rx = int(request.content_length or 0)
+
+
+@app.after_request
+def _telemetry_request_finish(response):
+    if request.path == "/api/telemetry":
+        return response
+    # Prefer the declared body length; calculating it can consume a streamed/file response.
+    try:
+        tx_bytes = max(0, int(response.headers.get("Content-Length", 0) or 0))
+    except (TypeError, ValueError):
+        tx_bytes = 0
+    elapsed_ms = None
+    started = getattr(g, "nocturne_request_started", None)
+    if started is not None:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+    with _telemetry_lock:
+        _telemetry["app_tx_bytes"] += max(0, tx_bytes)
+        _telemetry["app_rx_bytes"] += max(0, int(getattr(g, "nocturne_request_rx", 0)))
+        _telemetry["app_requests"] += 1
+        _telemetry_events.appendleft({
+            "host": "NOCTURNE / WebView", "status": int(response.status_code),
+            "bytes": max(0, tx_bytes), "elapsed_ms": elapsed_ms,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+    return response
+
+
+def telemetry_snapshot() -> dict[str, Any]:
+    global _telemetry_snapshot
+    now = time.monotonic()
+    with _telemetry_lock:
+        current = {k: int(_telemetry[k]) for k in ("upstream_bytes", "app_tx_bytes", "app_rx_bytes", "upstream_requests", "app_requests")}
+        previous = dict(_telemetry_snapshot)
+        duration = max(0.25, now - float(previous.get("at", now)))
+        rates = {
+            "upstream_bps": max(0, round((current["upstream_bytes"] - int(previous.get("upstream_bytes", 0))) / duration)),
+            "app_tx_bps": max(0, round((current["app_tx_bytes"] - int(previous.get("app_tx_bytes", 0))) / duration)),
+            "app_rx_bps": max(0, round((current["app_rx_bytes"] - int(previous.get("app_rx_bytes", 0))) / duration)),
+        }
+        _telemetry_snapshot = {**current, "at": now}
+        events = list(_telemetry_events)[:12]
+        latest = dict(_telemetry.get("last_http_event") or {})
+        last_ms = _telemetry.get("last_upstream_ms")
+    return {
+        "ok": True, **current, **rates,
+        "uptime_s": round(now - _telemetry_started, 1),
+        "last_upstream_ms": last_ms, "last_http_event": latest,
+        "events": events,
+        "measurement": "HTTP response-body bytes; excludes TCP/TLS overhead and direct WebView traffic outside NOCTURNE proxy routes",
+    }
 
 _cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
@@ -767,6 +865,8 @@ _PROVIDER_INTERVALS = {
     "animap": 0.35,
     "ann": 1.1,
     "tenrai": MAL_MIN_INTERVAL,
+    "mangadex": 0.24,
+    "mangabaka": 0.45,
 }
 _provider_locks: dict[str, threading.Lock] = {}
 _provider_last: dict[str, float] = {}
@@ -854,7 +954,8 @@ def _anilist_graphql(query: str, variables: dict[str, Any], ttl: int = 1800) -> 
     data = payload.get("data")
     if not isinstance(data, dict):
         raise RuntimeError("AniList: struktur data tidak dikenali.")
-    cache_set(cache_key, data, ttl)
+    if ttl > 0:
+        cache_set(cache_key, data, ttl)
     return data
 
 
@@ -1099,6 +1200,19 @@ def provider_status() -> list[dict[str, Any]]:
         "MiteNime": lambda: _external_json("mitenime", MITENIME_BASE + "/search", {"q": "Cowboy Bebop"}, 300),
         "AniMap": lambda: _external_json("animap", ANIMAP_BASE + "/api/search", {"q": "Cowboy Bebop", "limit": 1}, 300),
         "Anime News Network": lambda: _external_text("ann", ANN_BASE + "/api.xml", {"title": "~Cowboy Bebop"}, 300),
+        "MangaDex API": lambda: _manga_public_json("mangadex", MANGADEX_API + "/manga", {"limit": 1, "contentRating[]": ["safe"]}, ttl=0),
+        "MangaBaka API": lambda: _manga_public_json("mangabaka", MANGABAKA_API + "/v2/series/search", {"q": "One Piece", "type": ["manga", "manhwa", "manhua"], "content_rating": ["safe"], "limit": 1}, ttl=0),
+        "AniList Manga GraphQL": lambda: _anilist_graphql("query { Page(page:1,perPage:1){ media(type:MANGA,sort:POPULARITY_DESC){ id } } }", {}, ttl=0),
+    }
+    host_map = {
+        "Tenrai / MAL": urlparse(MAL_API_BASE).hostname,
+        "AniList": urlparse(ANILIST_URL).hostname,
+        "AniList Manga GraphQL": urlparse(ANILIST_URL).hostname,
+        "MiteNime": urlparse(MITENIME_BASE).hostname,
+        "AniMap": urlparse(ANIMAP_BASE).hostname,
+        "Anime News Network": urlparse(ANN_BASE).hostname,
+        "MangaDex API": urlparse(MANGADEX_API).hostname,
+        "MangaBaka API": urlparse(MANGABAKA_API).hostname,
     }
     output = []
     with ThreadPoolExecutor(max_workers=len(probes)) as pool:
@@ -1109,10 +1223,16 @@ def provider_status() -> list[dict[str, Any]]:
             elapsed = int((time.monotonic() - starts[name]) * 1000)
             try:
                 future.result()
-                output.append({"name": name, "ok": True, "status": "ONLINE", "elapsed_ms": elapsed})
+                ok, error = True, None
             except Exception as exc:
-                output.append({"name": name, "ok": False, "status": "OFFLINE / ERROR", "error": str(exc)[:220], "elapsed_ms": elapsed})
-    return sorted(output, key=lambda x: x["name"])
+                ok, error = False, str(exc)[:220]
+            host = host_map.get(name)
+            with _telemetry_lock:
+                event = next((item for item in _telemetry_events if host and item.get("host") == host), {})
+            output.append({"name": name, "ok": ok, "status": "ONLINE" if ok else "OFFLINE / ERROR",
+                           "status_code": event.get("status"), "bytes": event.get("bytes", 0),
+                           "elapsed_ms": elapsed, "error": error})
+    return sorted(output, key=lambda item: item["name"])
 
 
 def diagnose_endpoint(path: str, label: str) -> dict[str, Any]:
@@ -1183,7 +1303,7 @@ def api_health():
 BINTANG_API_BASE = "https://bintangapi.my.id"
 BINTANG_TIMEOUT = (6, 20)
 _bintang_headers = {
-    "User-Agent": "NOCTURNE-Android/4.3 (personal anime archive)",
+    "User-Agent": "NOCTURNE-Android/4.4 (personal anime archive)",
     "Accept": "application/json",
 }
 _wallpaper_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -1492,7 +1612,7 @@ def fetch_random_anime_quote() -> dict[str, Any]:
     global _quote_cache
     response = requests.get(
         "https://api.animechan.io/v1/quotes/random",
-        headers={"User-Agent": "NOCTURNE-Android/4.3", "Accept": "application/json"},
+        headers={"User-Agent": "NOCTURNE-Android/4.4", "Accept": "application/json"},
         timeout=(5, 12),
     )
     response.raise_for_status()
@@ -1681,9 +1801,442 @@ def api_multiverse_discover():
         return jsonify({"ok": False, "error": str(exc)}), 502
 
 
+# ---------------------------------------------------------------------------
+# Manga catalogue + reader (MangaDex chapters, MangaBaka/AniList metadata)
+# ---------------------------------------------------------------------------
+MANGADEX_API = "https://api.mangadex.org"
+MANGABAKA_API = "https://api.mangabaka.org"
+MANGADEX_LANG_DEFAULT = ("id", "en")
+_MANGA_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+_MANGA_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.(?:jpg|jpeg|png|webp|avif)$", re.I)
+_MANGA_PROVIDER_INTERVALS = {"mangadex": 0.24, "mangabaka": 0.45}
+_MANGA_AT_HOME_MIN_INTERVAL = 1.6  # MangaDex @Home has a stricter per-IP request budget.
+
+
+def _manga_uuid(value: str) -> str:
+    value = str(value or "").strip()
+    if not _MANGA_UUID_RE.fullmatch(value):
+        raise ValueError("ID MangaDex tidak valid.")
+    return value.lower()
+
+
+def _manga_public_json(provider: str, url: str, params: dict[str, Any] | None = None, ttl: int = 900) -> Any:
+    allowed = {"mangadex": "api.mangadex.org", "mangabaka": "api.mangabaka.org"}
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != allowed.get(provider):
+        raise ValueError("Host API manga tidak diizinkan.")
+    material = json.dumps([provider, url, params or {}], sort_keys=True, ensure_ascii=False)
+    key = "manga:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    throttle_key = "mangadex_at_home" if provider == "mangadex" and "/at-home/server/" in parsed.path else provider
+    min_interval = _MANGA_AT_HOME_MIN_INTERVAL if throttle_key == "mangadex_at_home" else _MANGA_PROVIDER_INTERVALS[provider]
+    lock = _provider_lock(throttle_key)
+    with lock:
+        wait = min_interval - (time.monotonic() - _provider_last.get(throttle_key, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        _provider_last[throttle_key] = time.monotonic()
+        try:
+            response = _api_session.get(url, params=params or {}, timeout=(5, 12), allow_redirects=True)
+        except requests.Timeout as exc:
+            raise RuntimeError(f"{provider}: request timeout.") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"{provider}: koneksi gagal: {exc}") from exc
+    if response.status_code == 429:
+        retry = response.headers.get("Retry-After", "60")
+        raise RuntimeError(f"{provider}: HTTP 429, tunggu {retry} detik sebelum mencoba lagi.")
+    if response.status_code in (403, 451):
+        raise RuntimeError(f"{provider}: akses ditolak HTTP {response.status_code}.")
+    if response.status_code >= 400:
+        raise RuntimeError(f"{provider}: HTTP {response.status_code}.")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{provider}: respons bukan JSON valid.") from exc
+    if ttl > 0:
+        cache_set(key, payload, ttl)
+    return payload
+
+
+def _manga_https_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    parsed = urlparse(candidate)
+    return candidate if parsed.scheme == "https" and parsed.hostname else ""
+
+
+def _manga_title(value: Any) -> str:
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, dict):
+        for key in ("en", "en_us", "ja-ro", "ja", "romaji", "english", "native", "userPreferred"):
+            if value.get(key):
+                return clean_text(str(value[key]))
+        for item in value.values():
+            if item:
+                return clean_text(str(item))
+    return "Untitled"
+
+
+def _mangadex_cover(item: dict[str, Any]) -> str:
+    manga_id = str(item.get("id") or "")
+    for rel in item.get("relationships") or []:
+        if rel.get("type") == "cover_art":
+            filename = ((rel.get("attributes") or {}).get("fileName") or "")
+            if _MANGA_UUID_RE.fullmatch(manga_id) and _MANGA_FILE_RE.fullmatch(filename):
+                return f"/api/manga/cover/{manga_id}/{filename}.256.jpg"
+    return ""
+
+
+def _manga_normalize_mangadex(item: dict[str, Any]) -> dict[str, Any]:
+    attrs = item.get("attributes") or {}
+    title = _manga_title(attrs.get("title"))
+    alt = [_manga_title(x) for x in (attrs.get("altTitles") or [])[:3]]
+    desc = _manga_title(attrs.get("description")) if attrs.get("description") else ""
+    if desc == "Untitled":
+        desc = ""
+    tags = [clean_text(str(((x.get("attributes") or {}).get("name") or {}).get("en") or "")) for x in (attrs.get("tags") or [])]
+    return {
+        "provider": "mangadex", "id": item.get("id"), "title": title,
+        "alt_titles": [x for x in alt if x and x != "Untitled"],
+        "cover": _mangadex_cover(item), "description": desc,
+        "status": attrs.get("status"), "year": attrs.get("year"),
+        "content_rating": attrs.get("contentRating"), "demographic": attrs.get("publicationDemographic"),
+        "tags": [x for x in tags if x][:8],
+        "url": f"https://mangadex.org/title/{item.get('id')}" if item.get("id") else "",
+    }
+
+
+def _manga_search_mangadex(q: str) -> list[dict[str, Any]]:
+    payload = _manga_public_json("mangadex", MANGADEX_API + "/manga", {
+        "title": q, "limit": 24, "offset": 0, "order[relevance]": "desc",
+        "contentRating[]": ["safe", "suggestive"],
+        "includes[]": ["cover_art", "author", "artist"],
+    }, ttl=600)
+    return [_manga_normalize_mangadex(x) for x in (payload.get("data") or []) if isinstance(x, dict)]
+
+
+def _mangabaka_collection(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data", payload)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("items", "series", "results", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
+    for key in ("items", "series", "results"):
+        if isinstance(payload.get(key), list):
+            return payload[key]
+    return []
+
+
+def _mangabaka_cover(item: dict[str, Any]) -> str:
+    # API schemas and upstream adapters may expose the same artwork with different names.
+    for key in ("cover", "cover_image", "cover_url", "coverUrl", "main_cover", "mainCover", "image", "thumbnail", "poster"):
+        value = item.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            return value
+        if isinstance(value, dict):
+            for candidate in ("x450", "x350", "x250", "large", "original", "url", "src", "image_url"):
+                url = value.get(candidate)
+                if isinstance(url, str) and url.startswith("https://"):
+                    return url
+    return ""
+
+
+def _manga_search_mangabaka(q: str) -> list[dict[str, Any]]:
+    payload = _manga_public_json("mangabaka", MANGABAKA_API + "/v2/series/search", {
+        "q": q, "type": ["manga", "manhwa", "manhua"], "page": 1, "limit": 24,
+        "content_rating": ["safe", "suggestive"],
+    }, ttl=900)
+    rows = _mangabaka_collection(payload)
+    out = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        title = _manga_title(item.get("title") or item.get("titles") or item.get("name"))
+        out.append({
+            "provider": "mangabaka", "id": item.get("id") or item.get("series_id"),
+            "title": title, "cover": _mangabaka_cover(item),
+            "description": clean_text(str(item.get("description") or item.get("synopsis") or "")),
+            "status": item.get("status"), "year": item.get("year"),
+            "url": _manga_https_url(item.get("url") or item.get("site_url")),
+            "source_ids": item.get("source") or item.get("sources") or {},
+        })
+    return out
+
+
+def _anilist_manga_media(media: dict[str, Any]) -> dict[str, Any]:
+    title = media.get("title") or {}
+    cover = media.get("coverImage") or {}
+    return {
+        "provider": "anilist", "id": media.get("id"),
+        "title": title.get("userPreferred") or title.get("english") or title.get("romaji") or "Untitled",
+        "alt_titles": [x for x in (title.get("english"), title.get("romaji"), title.get("native")) if x],
+        "cover": cover.get("extraLarge") or cover.get("large") or "",
+        "description": clean_text(re.sub(r"<[^>]*>", " ", str(media.get("description") or ""))),
+        "status": media.get("status"), "year": (media.get("startDate") or {}).get("year"),
+        "format": media.get("format"), "chapters": media.get("chapters"),
+        "score": media.get("averageScore"), "url": _manga_https_url(media.get("siteUrl") or f"https://anilist.co/manga/{media.get('id')}"),
+        "external_links": media.get("externalLinks") or [],
+    }
+
+
+def _manga_search_anilist(q: str) -> list[dict[str, Any]]:
+    gql = """query ($search: String) { Page(page: 1, perPage: 24) { media(search: $search, type: MANGA, isAdult: false, sort: [SEARCH_MATCH]) { id title { romaji english native userPreferred } coverImage { extraLarge large } description(asHtml: false) format status chapters startDate { year } averageScore siteUrl externalLinks { site url } } } }"""
+    payload = _anilist_graphql(gql, {"search": q}, ttl=900)
+    return [_anilist_manga_media(x) for x in (((payload.get("Page") or {}).get("media")) or []) if isinstance(x, dict)]
+
+
+def manga_search(q: str, provider: str = "all") -> dict[str, Any]:
+    q = clean_text(q)[:100]
+    if len(q) < 2:
+        raise ValueError("Masukkan minimal 2 karakter untuk mencari manga.")
+    allowed = {"mangadex", "mangabaka", "anilist"}
+    selected = list(allowed) if provider == "all" else [provider]
+    if any(x not in allowed for x in selected):
+        raise ValueError("Provider manga tidak dikenal.")
+    functions = {"mangadex": _manga_search_mangadex, "mangabaka": _manga_search_mangabaka, "anilist": _manga_search_anilist}
+    results: dict[str, list[dict[str, Any]]] = {}
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        futures = {pool.submit(functions[name], q): name for name in selected}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                errors[name] = str(exc)[:220]
+    ordered = []
+    for name in ("mangadex", "mangabaka", "anilist"):
+        ordered.extend(results.get(name, []))
+    return {"query": q, "items": ordered, "providers": {k: len(v) for k, v in results.items()}, "errors": errors}
+
+
+def manga_detail(provider: str, manga_id: str) -> dict[str, Any]:
+    if provider == "mangadex":
+        manga_id = _manga_uuid(manga_id)
+        payload = _manga_public_json("mangadex", MANGADEX_API + "/manga/" + manga_id, {
+            "includes[]": ["cover_art", "author", "artist"],
+        }, ttl=900)
+        data = payload.get("data") or {}
+        result = _manga_normalize_mangadex(data)
+        authors, artists = [], []
+        for rel in data.get("relationships") or []:
+            name = clean_text(str(((rel.get("attributes") or {}).get("name")) or ""))
+            if name and rel.get("type") == "author": authors.append(name)
+            if name and rel.get("type") == "artist": artists.append(name)
+        result["authors"] = authors[:8]
+        result["artists"] = artists[:8]
+        result["chapter_source"] = "mangadex"
+        return result
+    if provider == "mangabaka":
+        manga_id = str(int(manga_id))
+        payload = _manga_public_json("mangabaka", MANGABAKA_API + "/v2/series/" + manga_id, {"schema": "full"}, ttl=900)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict): data = payload if isinstance(payload, dict) else {}
+        return {
+            "provider": "mangabaka", "id": manga_id,
+            "title": _manga_title(data.get("title") or data.get("titles") or data.get("name")),
+            "cover": _mangabaka_cover(data), "description": clean_text(str(data.get("description") or data.get("synopsis") or "")),
+            "status": data.get("status"), "year": data.get("year"), "authors": data.get("authors") or [],
+            "source_ids": data.get("source") or data.get("sources") or {},
+            "chapter_source": "mangadex", "external_url": _manga_https_url(data.get("url") or data.get("site_url")),
+        }
+    if provider == "anilist":
+        media_id = int(manga_id)
+        gql = """query ($id: Int) { Media(id: $id, type: MANGA) { id title { romaji english native userPreferred } coverImage { extraLarge large } description(asHtml: false) format status chapters volumes startDate { year } averageScore siteUrl externalLinks { site url } } }"""
+        payload = _anilist_graphql(gql, {"id": media_id}, ttl=900)
+        media = payload.get("Media")
+        if not isinstance(media, dict): raise RuntimeError("Manga tidak ditemukan pada AniList.")
+        result = _anilist_manga_media(media)
+        result["volumes"] = media.get("volumes")
+        result["chapter_source"] = "mangadex"
+        return result
+    raise ValueError("Provider manga tidak dikenal.")
+
+
+def manga_chapters(manga_id: str, languages: list[str], offset: int = 0) -> dict[str, Any]:
+    manga_id = _manga_uuid(manga_id)
+    safe_languages = [x for x in languages[:5] if re.fullmatch(r"[a-zA-Z-]{2,5}", x)]
+    if not safe_languages: safe_languages = list(MANGADEX_LANG_DEFAULT)
+    offset = max(0, min(10000, int(offset or 0)))
+    params: dict[str, Any] = {
+        "limit": 100, "offset": offset,
+        "translatedLanguage[]": safe_languages,
+        "contentRating[]": ["safe", "suggestive"],
+        "includes[]": ["scanlation_group", "user"],
+        "order[volume]": "desc", "order[chapter]": "desc",
+    }
+    payload = _manga_public_json("mangadex", f"{MANGADEX_API}/manga/{manga_id}/feed", params, ttl=240)
+    chapters = []
+    for item in payload.get("data") or []:
+        attrs = item.get("attributes") or {}
+        group, uploader = "Unknown group", ""
+        for rel in item.get("relationships") or []:
+            rel_attrs = rel.get("attributes") or {}
+            if rel.get("type") == "scanlation_group": group = clean_text(str(rel_attrs.get("name") or group))
+            elif rel.get("type") == "user": uploader = clean_text(str(rel_attrs.get("username") or ""))
+        chapters.append({
+            "id": item.get("id"), "chapter": attrs.get("chapter"), "volume": attrs.get("volume"),
+            "title": clean_text(str(attrs.get("title") or "")), "language": attrs.get("translatedLanguage"),
+            "pages": attrs.get("pages"), "published_at": attrs.get("publishAt"),
+            "group": group, "uploader": uploader,
+        })
+    return {"items": chapters, "total": int(payload.get("total") or len(chapters)), "offset": offset, "limit": int(payload.get("limit") or 100), "languages": safe_languages}
+
+
+def manga_chapter_reader(chapter_id: str, quality: str = "data") -> dict[str, Any]:
+    chapter_id = _manga_uuid(chapter_id)
+    quality = "data-saver" if quality == "data-saver" else "data"
+    chapter_payload = _manga_public_json("mangadex", f"{MANGADEX_API}/chapter/{chapter_id}", {
+        "includes[]": ["manga", "scanlation_group", "user"],
+    }, ttl=900)
+    chapter = chapter_payload.get("data") or {}
+    attrs = chapter.get("attributes") or {}
+    relations = {x.get("type"): x for x in (chapter.get("relationships") or [])}
+    group = ((relations.get("scanlation_group") or {}).get("attributes") or {}).get("name") or "Unknown group"
+    uploader = ((relations.get("user") or {}).get("attributes") or {}).get("username") or ""
+    manga_rel = relations.get("manga") or {}
+    manga_rel_attrs = manga_rel.get("attributes") or {}
+    home = _manga_public_json("mangadex", f"{MANGADEX_API}/at-home/server/{chapter_id}", {}, ttl=600)
+    chapter_data = home.get("chapter") or {}
+    filenames = chapter_data.get("dataSaver" if quality == "data-saver" else "data") or []
+    if not isinstance(filenames, list) or not filenames:
+        raise RuntimeError("MangaDex tidak menyediakan halaman untuk chapter ini.")
+    pages = [f"/api/manga/page/{chapter_id}/{i}?quality={quality}" for i in range(len(filenames))]
+    return {
+        "id": chapter_id, "chapter": attrs.get("chapter"), "volume": attrs.get("volume"),
+        "title": clean_text(str(attrs.get("title") or "")), "language": attrs.get("translatedLanguage"),
+        "published_at": attrs.get("publishAt"), "pages": pages, "page_count": len(pages),
+        "group": clean_text(str(group)), "uploader": clean_text(str(uploader)),
+        "manga_title": _manga_title(manga_rel_attrs.get("title")) if manga_rel_attrs else "MangaDex chapter",
+        "quality": quality, "source_url": f"https://mangadex.org/chapter/{chapter_id}",
+    }
+
+
+def _mangadex_image_response(url: str):
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "uploads.mangadex.org" or host.endswith(".mangadex.network")):
+        raise ValueError("CDN MangaDex tidak valid.")
+    response = _api_session.get(url, headers={"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8", "Referer": "https://mangadex.org/"}, timeout=(5, 18), allow_redirects=True)
+    final = urlparse(response.url)
+    final_host = (final.hostname or "").lower()
+    if final.scheme != "https" or not (final_host == "uploads.mangadex.org" or final_host.endswith(".mangadex.network")):
+        raise RuntimeError("CDN mengalihkan ke host yang tidak diizinkan.")
+    if response.status_code >= 400:
+        raise RuntimeError(f"CDN MangaDex HTTP {response.status_code}.")
+    if len(response.content) > 18 * 1024 * 1024:
+        raise RuntimeError("Halaman gambar melebihi batas 18 MB.")
+    mime = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0].lower()
+    if mime not in {"image/jpeg", "image/png", "image/webp", "image/avif"}:
+        raise RuntimeError("CDN mengirim tipe file yang tidak didukung.")
+    return response.content, mime
+
+
 @app.get("/api/providers/status")
 def api_providers_status():
     return jsonify({"ok": True, "providers": provider_status()})
+
+
+@app.get("/api/telemetry")
+def api_telemetry():
+    return jsonify(telemetry_snapshot())
+
+
+@app.get("/api/manga/search")
+def api_manga_search():
+    try:
+        data = manga_search(request.args.get("q", ""), request.args.get("provider", "all"))
+        return jsonify({"ok": True, **data})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.get("/api/manga/detail")
+def api_manga_detail():
+    try:
+        data = manga_detail(request.args.get("provider", ""), request.args.get("id", ""))
+        return jsonify({"ok": True, **data})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.get("/api/manga/chapters")
+def api_manga_chapters():
+    try:
+        manga_id = request.args.get("id", "")
+        languages = [x.strip() for x in request.args.get("lang", "id,en").split(",") if x.strip()]
+        offset = request.args.get("offset", 0, type=int)
+        return jsonify({"ok": True, **manga_chapters(manga_id, languages, offset)})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.get("/api/manga/chapter/<chapter_id>")
+def api_manga_chapter_reader(chapter_id: str):
+    try:
+        return jsonify({"ok": True, **manga_chapter_reader(chapter_id, request.args.get("quality", "data"))})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.get("/api/manga/page/<chapter_id>/<int:index>")
+def api_manga_page(chapter_id: str, index: int):
+    try:
+        chapter_id = _manga_uuid(chapter_id)
+        quality = "data-saver" if request.args.get("quality") == "data-saver" else "data"
+        home = _manga_public_json("mangadex", f"{MANGADEX_API}/at-home/server/{chapter_id}", {}, ttl=600)
+        data = home.get("chapter") or {}
+        filenames = data.get("dataSaver" if quality == "data-saver" else "data") or []
+        if index < 0 or index >= len(filenames):
+            return jsonify({"ok": False, "error": "Indeks halaman di luar rentang."}), 404
+        filename = str(filenames[index])
+        if not _MANGA_FILE_RE.fullmatch(filename):
+            return jsonify({"ok": False, "error": "Nama file chapter tidak valid."}), 400
+        base = str(home.get("baseUrl") or "").rstrip("/")
+        host = (urlparse(base).hostname or "").lower()
+        if urlparse(base).scheme != "https" or not (host == "uploads.mangadex.org" or host.endswith(".mangadex.network")):
+            return jsonify({"ok": False, "error": "Host gambar MangaDex tidak valid."}), 502
+        image_url = f"{base}/{quality}/{data.get('hash','')}/{filename}"
+        if not re.fullmatch(r"[A-Za-z0-9]{8,64}", str(data.get("hash") or "")):
+            return jsonify({"ok": False, "error": "Hash chapter tidak valid."}), 502
+        body, mime = _mangadex_image_response(image_url)
+        response = send_file(io.BytesIO(body), mimetype=mime, max_age=900, conditional=False)
+        response.headers["Cache-Control"] = "public, max-age=900, immutable"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.get("/api/manga/cover/<manga_id>/<filename>")
+def api_manga_cover(manga_id: str, filename: str):
+    try:
+        manga_id = _manga_uuid(manga_id)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.256\.jpg", filename, re.I):
+            return jsonify({"ok": False, "error": "Nama cover tidak valid."}), 400
+        body, mime = _mangadex_image_response(f"https://uploads.mangadex.org/covers/{manga_id}/{filename}")
+        response = send_file(io.BytesIO(body), mimetype=mime, max_age=3600, conditional=False)
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
 
 
 @app.get("/api/multiverse/airing")
@@ -1858,7 +2411,17 @@ PAGE = r'''<!doctype html>
 *{box-sizing:border-box}html{min-height:100%;scroll-behavior:smooth}body{margin:0;background:radial-gradient(ellipse at 12% -8%,#34363b66,transparent 36%),radial-gradient(ellipse at 98% 30%,#292b3066,transparent 32%),var(--bg);color:var(--text);font-family:Georgia,'Times New Roman',serif;min-height:100vh;overflow-y:auto}
 body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.13;background-image:repeating-linear-gradient(0deg,transparent 0 3px,#fff1 4px),repeating-linear-gradient(90deg,transparent 0 3px,#0002 4px);mix-blend-mode:soft-light;z-index:0}
 button,input{font:inherit}button{cursor:pointer}.app{position:relative;z-index:1;min-height:100vh}.topbar{position:sticky;top:0;z-index:20;background:#101113ed;backdrop-filter:blur(14px);border-bottom:1px solid var(--line);padding:12px clamp(14px,3vw,34px);display:flex;gap:18px;align-items:center;justify-content:space-between}.brand{display:flex;gap:12px;align-items:center;min-width:max-content}.sigil{width:42px;height:42px;display:grid;place-items:center;overflow:hidden;border-radius:50%;background:#050505;box-shadow:0 0 18px #ffffff20}.sigil img{display:block;width:100%;height:100%;object-fit:cover}.brandname{font-size:18px;letter-spacing:3px;font-weight:bold}.brandname small{display:block;color:var(--gold);font-size:9px;letter-spacing:4px;margin-top:3px}.searchbar{display:flex;max-width:580px;width:100%;border:1px solid var(--line);background:#1d1f23;border-radius:4px;overflow:hidden}.searchbar input{min-width:0;flex:1;background:transparent;color:var(--text);border:0;outline:none;padding:11px 14px;font-family:Arial,sans-serif}.searchbar button{border:0;background:var(--red);color:white;padding:0 17px;font-family:Arial,sans-serif;font-weight:bold;letter-spacing:1px}.status{font:11px Arial,sans-serif;color:var(--muted);white-space:nowrap}
-.shell{display:grid;grid-template-columns:220px minmax(0,1fr);max-width:1600px;margin:0 auto;min-height:calc(100vh - 66px)}.sidebar{border-right:1px solid var(--line);padding:28px 16px;position:sticky;top:65px;align-self:start;height:calc(100vh - 65px);overflow-y:auto}.side-label{color:var(--gold);font-size:10px;letter-spacing:3px;margin:8px 10px 14px}.navbtn{width:100%;border:1px solid transparent;background:transparent;color:var(--muted);padding:12px 13px;text-align:left;margin:3px 0;border-radius:4px;font-size:14px;transition:.18s}.navbtn:hover,.navbtn.active{background:linear-gradient(90deg,#76253a44,transparent);border-color:#713045;color:var(--text)}.navbtn .ico{display:inline-block;width:25px;color:var(--red2)}.side-note{margin:35px 9px 0;padding:14px 12px;border-top:1px solid var(--line);color:#8d7883;font:11px/1.7 Arial,sans-serif}.main{padding:28px clamp(14px,3vw,38px) 70px;min-width:0;min-height:calc(100vh - 66px)}.hero{background-image:url('/assets/kolom/banner.svg');background-color:#202226;background-size:cover;background-position:center;border:1px solid #45484f;border-radius:7px;padding:28px clamp(18px,3vw,34px);margin-bottom:28px;position:relative;overflow:hidden;box-shadow:var(--shadow);isolation:isolate;min-height:170px}.hero:before{content:"";position:absolute;inset:-38%;z-index:1;pointer-events:none;opacity:.78;background:radial-gradient(ellipse at 18% 42%,#9e304c55 0,transparent 30%),radial-gradient(ellipse at 76% 58%,#b7a2ad24 0,transparent 26%),linear-gradient(112deg,transparent 35%,#d7a5b51c 49%,transparent 62%);background-size:155% 155%;animation:nocturneBannerDrift 13s ease-in-out infinite alternate,nocturneBannerPulse 7s ease-in-out infinite}
+.shell{display:grid;grid-template-columns:220px minmax(0,1fr);max-width:1600px;margin:0 auto;min-height:calc(100vh - 66px)}.sidebar{border-right:1px solid var(--line);padding:28px 16px;position:sticky;top:65px;align-self:start;height:calc(100vh - 65px);overflow-y:auto}.side-label{color:var(--gold);font-size:10px;letter-spacing:3px;margin:8px 10px 14px}.navbtn{width:100%;border:1px solid transparent;background:transparent;color:var(--muted);padding:12px 13px;text-align:left;margin:3px 0;border-radius:4px;font-size:14px;transition:.18s}.navbtn:hover,.navbtn.active{background:linear-gradient(90deg,#76253a44,transparent);border-color:#713045;color:var(--text)}.navbtn .ico{display:inline-block;width:25px;color:var(--red2)}.side-note{margin:35px 9px 0;padding:14px 12px;border-top:1px solid var(--line);color:#8d7883;font:11px/1.7 Arial,sans-serif}.main{padding:28px clamp(14px,3vw,38px) 70px;min-width:0;min-height:calc(100vh - 66px)}
+/* 4.4 cinematic banner + manga reader + live transport console */
+.hero{min-height:218px;border-color:#654150;background-position:center 46%;}
+.hero:after{content:"";right:5%;top:50%;width:clamp(170px,23vw,290px);height:clamp(170px,23vw,290px);border:1px solid #c36a8138;border-radius:50%;background:radial-gradient(circle at center,transparent 52%,#a33c5922 53%,transparent 54%),repeating-conic-gradient(from 12deg,#c8788d28 0 1deg,transparent 1deg 19deg);transform:translateY(-50%);animation:nocturneSigilTurn 48s linear infinite,nocturneSigilGlow 8s ease-in-out infinite;}
+.hero h1{background:linear-gradient(100deg,#fff 0%,#eed9df 36%,#cb788e 66%,#fff 90%);background-size:220% auto;-webkit-background-clip:text;background-clip:text;color:transparent;text-shadow:0 0 24px #b3425b25;animation:nocturneTitleShimmer 9s linear infinite;}
+@keyframes nocturneTitleShimmer{to{background-position:220% center}}
+.hero-content{max-width:760px}.manga-searchbar{display:grid;grid-template-columns:minmax(0,1fr) 170px auto;gap:9px;margin:18px 0}.field{border:1px solid #41434a;border-radius:4px;background:#111317;color:var(--text);padding:12px 13px;min-width:0;width:100%;font:13px Arial,sans-serif;outline:none}.field:focus{border-color:#a54a65;box-shadow:0 0 0 2px #a54a6526}.manga-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(142px,1fr));gap:15px}.manga-card{background:linear-gradient(155deg,#252329,#17181c);border:1px solid #3b3940;border-radius:6px;overflow:hidden;cursor:pointer;transition:transform .2s,border-color .2s,box-shadow .2s}.manga-card:hover{transform:translateY(-4px);border-color:#a54a65;box-shadow:0 13px 30px #0008}.manga-cover{aspect-ratio:2/2.9;background:linear-gradient(145deg,#38212d,#111);overflow:hidden}.manga-cover img{width:100%;height:100%;object-fit:cover;display:block}.manga-card-info{padding:10px}.manga-card-title{font-size:13px;line-height:1.35;min-height:34px;color:#f2e9ec}.manga-provider{display:inline-block;font:9px Arial,sans-serif;letter-spacing:1.2px;color:#d8a0ae;border:1px solid #754153;padding:4px 6px;border-radius:2px;margin-top:7px;text-transform:uppercase}.manga-detail{display:grid;grid-template-columns:minmax(130px,210px) minmax(0,1fr);gap:20px}.manga-detail-cover{width:100%;max-height:330px;object-fit:cover;border:1px solid #57404a;border-radius:5px}.manga-desc{font:13px/1.65 Arial,sans-serif;color:#bbb6bd;white-space:pre-line;max-height:180px;overflow:auto}.manga-chapter-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px 6px;border-bottom:1px solid #34353b}.manga-chapter-row:last-child{border-bottom:0}.manga-chapter-title{font-size:13px;color:#eee;line-height:1.4}.manga-chapter-meta{font:10px/1.6 Arial,sans-serif;color:var(--muted);margin-top:4px}.reader-toolbar{position:sticky;top:65px;z-index:10;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;background:#141519ee;border:1px solid #424149;border-radius:5px;padding:9px;margin-bottom:12px;backdrop-filter:blur(12px)}.reader-shell{background:#08090b;border:1px solid #34343a;border-radius:5px;overflow:hidden}.reader-pages{display:flex;flex-direction:column;align-items:center;gap:3px;touch-action:pan-y}.reader-page-wrap{position:relative;width:100%;max-width:980px;min-height:160px;display:flex;justify-content:center;background:#0c0d10;scroll-margin-top:122px}.reader-page{display:block;width:auto;max-width:100%;height:auto;max-height:none;object-fit:contain}.reader-page-index{position:absolute;right:9px;bottom:9px;background:#0b0b0dcc;color:#d8cbd0;border:1px solid #ffffff22;border-radius:3px;padding:4px 7px;font:10px Arial,sans-serif}.reader-loading{padding:24px;text-align:center;font:11px Arial,sans-serif;letter-spacing:2px;color:#be7c8f}.reader-credit{padding:12px;background:#17171b;color:#b7aab0;font:11px/1.7 Arial,sans-serif;text-align:center;border-top:1px solid #34343a}.reader-credit a{color:#e1a6b5}.telemetry-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:15px 0}.telemetry-card{padding:13px;border:1px solid #393a42;background:linear-gradient(145deg,#24252b,#17181d);border-radius:5px;min-width:0}.telemetry-card small{display:block;color:#a9a2aa;font:9px Arial,sans-serif;letter-spacing:1.3px;text-transform:uppercase}.telemetry-card strong{display:block;font:20px/1.3 Arial,sans-serif;color:#f1dce2;margin-top:7px;overflow-wrap:anywhere}.telemetry-card em{display:block;font:10px Arial,sans-serif;color:#bb8091;margin-top:5px;font-style:normal}.traffic-panel{border:1px solid #3b3940;border-radius:6px;background:#17181c;padding:15px;margin:14px 0}.traffic-bar{height:7px;border-radius:20px;background:#303139;overflow:hidden;margin:9px 0}.traffic-bar span{display:block;height:100%;width:0;background:linear-gradient(90deg,#693348,#d26d89,#e3bdc8);box-shadow:0 0 16px #c453744d;transition:width .75s ease}.traffic-label{display:flex;justify-content:space-between;gap:12px;font:10px Arial,sans-serif;color:#b8b1b9}.live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#8ec7a0;box-shadow:0 0 12px #8ec7a0;animation:livePulse 1.4s infinite}@keyframes livePulse{50%{opacity:.3;transform:scale(.72)}}.provider-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:9px}.provider-node{border:1px solid #393940;background:#1a1b20;border-radius:5px;padding:12px}.provider-node-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.provider-node strong{font-size:13px}.provider-metrics{display:flex;gap:12px;flex-wrap:wrap;font:10px Arial,sans-serif;color:#aaa3ab;margin-top:9px}.provider-meter{height:3px;background:#34343a;margin-top:10px;overflow:hidden}.provider-meter span{display:block;height:100%;background:linear-gradient(90deg,#7d354d,#d87d95);width:0;transition:width .5s}.http-event{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:9px;padding:8px 0;border-bottom:1px solid #303139;font:10px Arial,sans-serif;color:#bab3bb}.http-event:last-child{border:0}.http-event b{font-weight:normal;color:#eee}.traffic-legend{font:10px/1.7 Arial,sans-serif;color:#a8a2ab}
+@media(max-width:800px){.manga-searchbar{grid-template-columns:1fr}.manga-detail{grid-template-columns:110px minmax(0,1fr);gap:13px}.telemetry-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.reader-toolbar{top:0}.reader-page-wrap{scroll-margin-top:92px}}
+@media(max-width:430px){.manga-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.manga-chapter-row{grid-template-columns:minmax(0,1fr)}.manga-chapter-row .action{justify-self:start}.telemetry-card strong{font-size:17px}}
+@media(prefers-reduced-motion:reduce){.hero h1,.hero:after,.live-dot{animation:none}}
+.hero{background-image:url('/assets/kolom/banner.svg');background-color:#202226;background-size:cover;background-position:center;border:1px solid #45484f;border-radius:7px;padding:28px clamp(18px,3vw,34px);margin-bottom:28px;position:relative;overflow:hidden;box-shadow:var(--shadow);isolation:isolate;min-height:170px}.hero:before{content:"";position:absolute;inset:-38%;z-index:1;pointer-events:none;opacity:.78;background:radial-gradient(ellipse at 18% 42%,#9e304c55 0,transparent 30%),radial-gradient(ellipse at 76% 58%,#b7a2ad24 0,transparent 26%),linear-gradient(112deg,transparent 35%,#d7a5b51c 49%,transparent 62%);background-size:155% 155%;animation:nocturneBannerDrift 13s ease-in-out infinite alternate,nocturneBannerPulse 7s ease-in-out infinite}
 @keyframes nocturneBannerDrift{0%{transform:translate3d(-3%,1%,0) rotate(-3deg);background-position:0% 45%}50%{transform:translate3d(2%,-2%,0) rotate(1deg);background-position:65% 52%}100%{transform:translate3d(4%,2%,0) rotate(4deg);background-position:100% 48%}}
 @keyframes nocturneBannerPulse{0%,100%{opacity:.45}50%{opacity:.95}}
 .hero:after{content:"✦";position:absolute;right:7%;top:-50px;color:#b3445b18;font-size:240px;line-height:1;z-index:1;pointer-events:none;transform-origin:center;animation:nocturneSigilTurn 32s linear infinite,nocturneSigilGlow 6s ease-in-out infinite}
@@ -1885,6 +2448,9 @@ button,input{font:inherit}button{cursor:pointer}.app{position:relative;z-index:1
 .account-actions{display:flex;align-items:center;gap:7px}.account-actions button{white-space:nowrap}.profile-cover{height:170px;border-radius:7px;border:1px solid #45484f;background:linear-gradient(110deg,#34373d,#202226 60%,#17191d);background-size:cover;background-position:center;position:relative;overflow:hidden}.profile-cover:after{content:"";position:absolute;inset:0;background:linear-gradient(0deg,#0a0b0dcc,transparent 75%)}.profile-head{display:flex;align-items:end;gap:14px;margin:-46px 0 16px 18px;position:relative;z-index:1}.avatar-preview{width:90px;height:90px;flex:0 0 90px;border:3px solid #1a1c20;border-radius:50%;background:linear-gradient(145deg,#383a40,#17191d);display:grid;place-items:center;color:#d8d9dd;font-size:30px;overflow:hidden}.avatar-preview img{width:100%;height:100%;object-fit:cover}.profile-name{padding-bottom:7px}.profile-name h2{font-size:20px;font-weight:normal;margin:0 0 4px}.profile-name small{font:10px Arial,sans-serif;color:var(--muted);letter-spacing:1px}.profile-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.profile-form-grid .field{width:100%}.profile-upload{padding:14px;background:#15171b;border:1px solid var(--line);border-radius:6px}.profile-upload label{display:block;color:#d6d7da;font:12px Arial,sans-serif;margin-bottom:8px}.profile-upload input{max-width:100%;font:11px Arial,sans-serif;color:var(--muted)}.hero.has-custom-media{border-color:#555960}.hero.has-custom-media h1,.hero.has-custom-media p,.hero.has-custom-media .eyebrow{text-shadow:0 2px 12px #000}
 @media(max-width:620px){.profile-form-grid{grid-template-columns:1fr}.profile-cover{height:140px}.auth-card{padding:22px}.account-actions{width:100%;justify-content:flex-end}.topbar{align-items:flex-start}}
 
+/* Final banner composition override */
+.hero:after{content:"";right:5%;top:50%;width:clamp(170px,23vw,290px);height:clamp(170px,23vw,290px);border:1px solid #c36a8138;border-radius:50%;background:radial-gradient(circle at center,transparent 52%,#a33c5922 53%,transparent 54%),repeating-conic-gradient(from 12deg,#c8788d28 0 1deg,transparent 1deg 19deg);transform:translateY(-50%);animation:nocturneOrbitSpin 54s linear infinite,nocturneSigilGlow 8s ease-in-out infinite;}
+@keyframes nocturneOrbitSpin{to{transform:translateY(-50%) rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -1904,6 +2470,7 @@ button,input{font:inherit}button{cursor:pointer}.app{position:relative;z-index:1
     <button class="navbtn" data-tab="genres" onclick="loadTab('genres',this)"><span class="ico">❖</span> Genre</button>
     <button class="navbtn" data-tab="mal" onclick="loadTab('mal',this)"><span class="ico">✥</span> MyAnimeList</button>
     <button class="navbtn" data-tab="multiverse" onclick="loadTab('multiverse',this)"><span class="ico">✧</span> Multi-Source Search</button>
+    <button class="navbtn" data-tab="manga" onclick="loadTab('manga',this)"><span class="ico">▤</span> Manga Reader</button>
     <button class="navbtn" data-tab="discover" onclick="loadTab('discover',this)"><span class="ico">♛</span> Discovery Hub</button>
     <button class="navbtn" data-tab="news" onclick="loadTab('news',this)"><span class="ico">☷</span> Anime News</button>
     <button class="navbtn" data-tab="wallpapers" onclick="loadTab('wallpapers',this)"><span class="ico">▧</span> Anime Wallpapers</button>
@@ -1964,7 +2531,7 @@ function setTabActive(tab){document.querySelectorAll('.navbtn').forEach(b=>b.cla
 function itemGrid(items,sub=''){if(!items||!items.length)return '<div class="empty">Tidak ada data yang ditemukan dari halaman sumber.</div>';return `<div class="grid">${items.map(x=>`<article class="card" onclick="openAnime(decodeURIComponent('${jsArg(x.url)}'))"><div class="poster">${x.image?`<img loading="lazy" referrerpolicy="no-referrer" src="${esc(x.image)}" alt="${esc(x.title)}" onerror="this.style.display='none';this.parentElement.innerHTML='<div class=\'noimg\'>✧</div>'">`:'<div class="noimg">✧</div>'}</div><div class="cardbody"><div class="cardtitle">${esc(x.title)}</div><div class="cardsub">${esc(x.subtitle||sub||'OTAKUDESU')}</div></div></article>`).join('')}</div>`;}
 function sectionHead(title,sub='ARCHIVE'){return `<div class="section-head"><h2>${esc(title)}</h2><small>${esc(sub)}</small></div>`;}
 function showError(err){main.innerHTML=`<div class="hero"><div class="eyebrow">ARSIP TIDAK DAPAT DIAKSES</div><h1>Connection interrupted</h1><p>${esc(err.message||err)}</p></div><div class="notice error">Periksa koneksi internet, coba lagi, atau jalankan menu <b>Cek Endpoint</b>. Jika server sumber mengembalikan 403/anti-bot, aplikasi tidak akan mencoba melewati proteksi tersebut.</div><div class="toolbar"><button class="action" onclick="loadTab('${esc(currentTab)}')">Coba lagi</button><button class="action" onclick="loadTab('diagnose')">Cek endpoint</button></div>`;}
-async function loadTab(tab,btn=null){if(tab!=='home'&&activeHomeBannerUrl){URL.revokeObjectURL(activeHomeBannerUrl);activeHomeBannerUrl='';}if(tab!=='appearance'&&appearancePreviewUrl){URL.revokeObjectURL(appearancePreviewUrl);appearancePreviewUrl='';}currentTab=tab;backStack=[];setTabActive(tab);if(btn)setTabActive(tab);statusText.textContent='FETCHING · '+tab.toUpperCase();setLoading();try{
+async function loadTab(tab,btn=null){if(tab!=='providers'&&window.nocturneTelemetryTimer){clearInterval(window.nocturneTelemetryTimer);window.nocturneTelemetryTimer=null;}if(tab!=='home'&&activeHomeBannerUrl){URL.revokeObjectURL(activeHomeBannerUrl);activeHomeBannerUrl='';}if(tab!=='appearance'&&appearancePreviewUrl){URL.revokeObjectURL(appearancePreviewUrl);appearancePreviewUrl='';}currentTab=tab;backStack=[];setTabActive(tab);if(btn)setTabActive(tab);statusText.textContent='FETCHING · '+tab.toUpperCase();setLoading();try{
  if(tab==='home'){const d=await api('/api/home',40000);main.innerHTML=`<div class="hero" id="homeHero"><div class="hero-media" id="homeHeroMedia" aria-hidden="true"></div><div class="hero-shade"></div><div class="hero-content"><div class="eyebrow">THE MIDNIGHT ANIME INDEX</div><h1>Selamat datang di NOCTURNE</h1><p>APK streaming berbasis scraper dan API. Pilih poster untuk membuka detail judul dan daftar episode.</p></div></div>${sectionHead('Rilisan dari Beranda','LATEST FROM SOURCE')}${itemGrid(d.items)}`;applyHomeBanner();}
  else if(tab==='ongoing'){ongoingPage=1;await loadOngoing(1,false);}
  else if(tab==='anime-list'){const d=await api('/api/catalog?section=anime-list',30000);renderAnimeList(d);}
@@ -1972,6 +2539,7 @@ async function loadTab(tab,btn=null){if(tab!=='home'&&activeHomeBannerUrl){URL.r
  else if(tab==='genres'){const d=await api('/api/genres',25000);renderGenreList(d);}
  else if(tab==='mal'){renderMalSearch();}
  else if(tab==='multiverse'){renderMultiverseSearch();}
+ else if(tab==='manga'){renderMangaSearch();}
  else if(tab==='discover'){await loadMultiverseDiscover();}
  else if(tab==='news'){await loadAnimeNews();}
  else if(tab==='wallpapers'){await renderAnimeWallpapers();}
@@ -2109,8 +2677,43 @@ async function loadAiringCalendar(){setLoading('MEMUAT JADWAL PENAYANGAN');try{c
 
 async function loadAnimeNews(){
  setLoading('MEMUAT BERITA ANIME');try{const d=await api('/api/multiverse/news',16000);const rows=d.items||[];main.innerHTML=`${sectionHead('Anime News','MYANIMELIST / TENRAI NEWS FEED')}<div class="notice">Feed berita katalog Tenrai. Ketersediaan feed bergantung provider. Untuk liputan penuh, buka sumber penerbit.</div>${rows.length?`<div class="list">${rows.map(x=>`<article class="content-card"><div class="eyebrow">${esc(x.date||x.date_posted||'NEWS')}</div><h3>${esc(x.title||'Anime news')}</h3><p class="desc">${esc((x.excerpt||x.intro||'').slice(0,500))}</p>${x.url?`<a class="source-link" href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">Baca sumber ↗</a>`:''}</article>`).join('')}</div>`:'<div class="empty">Feed berita kosong saat ini.</div>'}`;}catch(e){showError(e);}}
+let currentMangaDetail=null;
+let currentMangaChapterId='';
+let currentMangaPages=[];
+let currentMangaQuality='data';
+let currentReaderIndex=0;
+let readerTouchStart=null;
+function renderMangaSearch(){main.innerHTML=`${sectionHead('Manga Reader','MANGADEX · MANGABAKA · ANILIST')}<div class="hero"><div class="eyebrow">NOCTURNE · INK & SHADOW ARCHIVE</div><h1>Beyond the midnight pages.</h1><p>Telusuri manga dari tiga katalog. Baca chapter MangaDex dengan mode scroll vertikal yang dipadukan navigasi swipe horizontal.</p></div><div class="manga-searchbar"><input id="mangaQuery" class="field" type="search" placeholder="Cari judul manga / manhwa..." autocomplete="off"><select id="mangaProvider" class="field"><option value="all">Semua katalog</option><option value="mangadex">MangaDex</option><option value="mangabaka">MangaBaka</option><option value="anilist">AniList</option></select><button class="action primary" onclick="searchManga()">Cari manga</button></div><div class="notice">MangaDex menyediakan chapter dan halaman reader. MangaBaka serta AniList digunakan untuk metadata, detail katalog, dan referensi sumber. Kredit katalog: <a href="https://api.mangabaka.org/docs" target="_blank" rel="noopener noreferrer">MangaBaka</a> dan <a href="https://docs.anilist.co/guide/graphql/" target="_blank" rel="noopener noreferrer">AniList docs</a>. Hasil katalog MangaBaka/AniList dapat dicari lagi di MangaDex untuk menemukan chapter yang tersedia.</div><div id="mangaResults"><div class="empty">Masukkan judul lalu mulai pencarian.</div></div>`;const input=document.getElementById('mangaQuery');input.addEventListener('keydown',e=>{if(e.key==='Enter')searchManga();});}
+async function searchManga(){const q=document.getElementById('mangaQuery')?.value.trim();const provider=document.getElementById('mangaProvider')?.value||'all';const box=document.getElementById('mangaResults');if(!q||!box)return;box.innerHTML='<div class="loading">SEARCHING THE THREE CATALOGUES...</div>';try{const d=await api('/api/manga/search?q='+encodeURIComponent(q)+'&provider='+encodeURIComponent(provider),45000);const items=d.items||[];box.innerHTML=`<div class="toolbar"><span class="pill">${items.length} RESULTS</span><span class="muted">${Object.entries(d.providers||{}).map(([k,v])=>k.toUpperCase()+': '+v).join(' · ')}</span></div>${Object.keys(d.errors||{}).length?`<div class="notice error">Sebagian katalog tidak merespons: ${esc(Object.entries(d.errors).map(([k,v])=>k+': '+v).join(' | '))}</div>`:''}<div class="manga-grid">${items.map(x=>`<article class="manga-card" onclick="openMangaDetail('${esc(x.provider)}',decodeURIComponent('${jsArg(x.id)}'))"><div class="manga-cover">${x.cover?`<img loading="lazy" referrerpolicy="no-referrer" src="${esc(x.cover)}" alt="${esc(x.title)}" onerror="this.style.display='none'">`:'<div class="noimg">✧</div>'}</div><div class="manga-card-info"><div class="manga-card-title">${esc(x.title)}</div><span class="manga-provider">${esc(x.provider)}</span>${x.year?`<div class="cardsub">${esc(x.year)}</div>`:''}</div></article>`).join('')||'<div class="empty">Tidak ada judul ditemukan.</div>'}</div>`;}catch(e){box.innerHTML=`<div class="notice error">${esc(e.message)}</div>`;}}
+async function openMangaDetail(provider,id){rememberCurrent();setLoading('OPENING MANGA DOSSIER');try{const d=await api('/api/manga/detail?provider='+encodeURIComponent(provider)+'&id='+encodeURIComponent(id),30000);currentMangaDetail=d;const detailBox=`<div class="content-card"><div class="manga-detail"><div>${d.cover?`<img class="manga-detail-cover" src="${esc(d.cover)}" referrerpolicy="no-referrer" alt="cover">`:'<div class="manga-detail-cover noimg">✧</div>'}</div><div><div class="eyebrow">${esc(provider.toUpperCase())} CATALOGUE</div><h2 class="detail-title">${esc(d.title)}</h2><div class="manga-chapter-meta">${esc(d.status||'Status unknown')} · ${esc(d.year||'Year unknown')} ${d.format?'· '+esc(d.format):''} ${d.score?'· Score '+esc(d.score):''}</div><div class="manga-desc" style="margin-top:12px">${esc((d.description||'Deskripsi belum tersedia.').slice(0,3200))}</div><div class="manga-chapter-meta" style="margin-top:10px">${esc([...(d.authors||[]),...(d.artists||[])].join(' · ')||'Author info unavailable')}</div><div class="toolbar" style="margin-top:12px">${d.url||d.external_url?`<a class="action" href="${esc(d.url||d.external_url)}" target="_blank" rel="noopener noreferrer">Sumber katalog ↗</a>`:''}<button class="action primary" onclick="findMangaDexChapters(decodeURIComponent('${jsArg(d.title)}'))">Cari chapter di MangaDex</button></div></div></div></div>`;main.innerHTML=`<div class="toolbar"><button class="action" onclick="goBack()">← Kembali ke hasil</button></div>${detailBox}<div id="mangaChapterArea">${sectionHead('Daftar chapter','MANGADEX FEED')}<div class="notice">Chapter reader tersedia bila judul memiliki rilis di MangaDex. Pilih bahasa Indonesia / Inggris atau ubah filter.</div><div class="empty">Memuat sumber chapter...</div></div>`;if(provider==='mangadex'){await loadMangaChapters(d.id);}else{const area=document.getElementById('mangaChapterArea');if(area)area.innerHTML=`${sectionHead('Chapter availability','MANGADEX SEARCH')}<div class="notice">Katalog ${esc(provider)} tidak menjadi host halaman chapter. Cari judul yang sama di MangaDex untuk mendapatkan chapter yang dapat dibaca.</div>`;}}catch(e){showError(e);}}
+async function findMangaDexChapters(title){try{const d=await api('/api/manga/search?q='+encodeURIComponent(title)+'&provider=mangadex',30000);const items=d.items||[];const area=document.getElementById('mangaChapterArea');if(!area)return;area.innerHTML=`${sectionHead('Pilih edisi MangaDex','MATCHED TITLES')}<div class="list">${items.map(x=>`<button class="listbtn" onclick="loadMangaChapters(decodeURIComponent('${jsArg(x.id)}'))">${esc(x.title)} <span class="muted">${esc(x.status||'')}</span></button>`).join('')||'<div class="empty">Tidak ada pasangan judul di MangaDex.</div>'}</div>`;}catch(e){alert(e.message);}}
+async function loadMangaChapters(id,offset=0){const area=document.getElementById('mangaChapterArea');if(!area)return;area.innerHTML='<div class="loading">INDEXING CHAPTER RELEASES...</div>';try{const lang='id,en';const d=await api('/api/manga/chapters?id='+encodeURIComponent(id)+'&lang='+lang+'&offset='+offset,30000);const rows=d.items||[];area.innerHTML=`${sectionHead('Daftar chapter','MANGADEX · ID / EN RELEASES')}<div class="toolbar"><span class="pill">${d.total} CHAPTERS INDEXED</span><span class="muted">Bahasa: ${esc((d.languages||[]).join(', '))}</span></div><div class="content-card">${rows.map(x=>`<div class="manga-chapter-row"><div><div class="manga-chapter-title">${esc(x.volume?'Vol. '+x.volume+' · ':'')}${esc(x.chapter?'Chapter '+x.chapter:'Oneshot')}${x.title?' — '+esc(x.title):''}</div><div class="manga-chapter-meta">${esc((x.language||'').toUpperCase())} · ${esc(x.group)}${x.uploader?' · Uploaded by '+esc(x.uploader):''} · ${esc(x.published_at||'')}</div></div><button class="action primary" onclick="openMangaChapter(decodeURIComponent('${jsArg(x.id)}'))">Baca →</button></div>`).join('')||'<div class="empty">Chapter untuk bahasa Indonesia/Inggris belum tersedia.</div>'}</div>${d.total>offset+rows.length?`<div class="toolbar"><button class="action" onclick="loadMangaChapters(decodeURIComponent('${jsArg(id)}'),${offset+rows.length})">Muat chapter berikutnya</button></div>`:''}<div class="reader-credit">Chapter content from <a href="https://mangadex.org" target="_blank" rel="noopener noreferrer">MangaDex</a>. Credit ditampilkan per chapter untuk scanlation group dan uploader yang tercatat.</div>`;}catch(e){area.innerHTML=`<div class="notice error">${esc(e.message)}</div>`;}}
+async function openMangaChapter(chapterId,quality='data'){rememberCurrent();currentMangaChapterId=chapterId;currentMangaQuality=quality;currentReaderIndex=0;setLoading('PREPARING MANGADEX PAGE STREAM');try{const d=await api('/api/manga/chapter/'+encodeURIComponent(chapterId)+'?quality='+encodeURIComponent(quality),35000);currentMangaPages=d.pages||[];main.innerHTML=`<div class="reader-toolbar"><button class="action" onclick="goBack()">← Chapter list</button><div style="min-width:0;flex:1"><b style="font-size:12px">${esc(d.manga_title)} · ${esc(d.chapter?'Ch. '+d.chapter:'Oneshot')}</b><div class="manga-chapter-meta">${esc(d.title||'')} · ${currentMangaPages.length} pages</div></div><button class="action" onclick="switchMangaQuality('${quality==='data'?'data-saver':'data'}')">${quality==='data'?'Data saver':'Original'}</button></div><div class="reader-shell"><div class="reader-pages" id="readerPages">${currentMangaPages.map((url,i)=>`<div class="reader-page-wrap" id="readerPage${i}" data-page-index="${i}"><img class="reader-page" src="${esc(url)}" alt="Manga page ${i+1}" loading="${i<2?'eager':'lazy'}" referrerpolicy="no-referrer" onload="mangaPageLoaded(${i})" onerror="mangaPageFailed(this,${i})"><span class="reader-page-index">${i+1} / ${currentMangaPages.length}</span></div>`).join('')}</div><div class="reader-credit">Scanlation group: <b>${esc(d.group||'Unknown group')}</b>${d.uploader?' · Uploader: '+esc(d.uploader):''}<br>Source: <a href="${esc(d.source_url)}" target="_blank" rel="noopener noreferrer">MangaDex chapter</a> · MangaDex and scanlation-group credits are retained.</div></div><div class="toolbar" style="justify-content:space-between;margin-top:12px"><button class="action" onclick="moveReaderPage(-1)">← Previous page</button><span class="pill" id="readerPageProgress">PAGE 1 / ${currentMangaPages.length}</span><button class="action primary" onclick="moveReaderPage(1)">Next page →</button></div><div class="notice">Scroll vertikal untuk membaca seperti webtoon. Swipe ke kiri untuk maju satu halaman dan swipe ke kanan untuk kembali. Kualitas Data saver / Original bisa diganti dari toolbar.</div>`;bindMangaReaderGestures();window.scrollTo({top:0,behavior:'smooth'});}catch(e){showError(e);}}
+function mangaPageLoaded(index){const el=document.getElementById('readerPageProgress');if(el)el.textContent=`PAGE ${Math.min(currentMangaPages.length,Math.max(1,currentReaderIndex+1))} / ${currentMangaPages.length}`;}
+function mangaPageFailed(img,index){img.style.display='none';const parent=img.parentElement;if(parent&&!parent.querySelector('.reader-loading')){const msg=document.createElement('div');msg.className='reader-loading';msg.textContent='HALAMAN '+(index+1)+' GAGAL DIMUAT · COBA GANTI QUALITY';parent.appendChild(msg);}}
+function moveReaderPage(delta){const next=Math.max(0,Math.min(currentMangaPages.length-1,currentReaderIndex+delta));if(next===currentReaderIndex)return;currentReaderIndex=next;document.getElementById('readerPage'+next)?.scrollIntoView({behavior:'smooth',block:'start'});const el=document.getElementById('readerPageProgress');if(el)el.textContent=`PAGE ${next+1} / ${currentMangaPages.length}`;}
+function bindMangaReaderGestures(){const pages=document.getElementById('readerPages');if(!pages)return;if(window.nocturneReaderObserver)window.nocturneReaderObserver.disconnect();if('IntersectionObserver' in window){window.nocturneReaderObserver=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.isIntersecting&&entry.intersectionRatio>.15){currentReaderIndex=Number(entry.target.dataset.pageIndex||0);const label=document.getElementById('readerPageProgress');if(label)label.textContent=`PAGE ${currentReaderIndex+1} / ${currentMangaPages.length}`;}}},{threshold:[.55,.75]});pages.querySelectorAll('.reader-page-wrap').forEach(page=>window.nocturneReaderObserver.observe(page));}pages.addEventListener('touchstart',e=>{const t=e.changedTouches?.[0];if(t)readerTouchStart={x:t.clientX,y:t.clientY};},{passive:true});pages.addEventListener('touchend',e=>{const t=e.changedTouches?.[0];if(!t||!readerTouchStart)return;const dx=t.clientX-readerTouchStart.x,dy=t.clientY-readerTouchStart.y;readerTouchStart=null;if(Math.abs(dx)>58&&Math.abs(dx)>Math.abs(dy)*1.25)moveReaderPage(dx<0?1:-1);},{passive:true});pages.addEventListener('wheel',e=>{if(Math.abs(e.deltaX)>45&&Math.abs(e.deltaX)>Math.abs(e.deltaY))moveReaderPage(e.deltaX>0?1:-1);},{passive:true});document.onkeydown=e=>{if(currentTab!=='manga'||!document.getElementById('readerPages'))return;if(e.key==='ArrowRight'){moveReaderPage(1);e.preventDefault();}if(e.key==='ArrowLeft'){moveReaderPage(-1);e.preventDefault();}};}
+function switchMangaQuality(quality){if(!currentMangaChapterId)return;openMangaChapter(currentMangaChapterId,quality);}
+
 async function loadProviderStatus(){
- setLoading('MENGUJI SEMUA PROVIDER');try{const d=await api('/api/providers/status',24000);main.innerHTML=`${sectionHead('API Monitor','MULTI-PROVIDER HEALTH CHECK')}<div class="toolbar"><span class="pill">${d.providers.filter(x=>x.ok).length}/${d.providers.length} ONLINE</span><button class="action primary" onclick="loadProviderStatus()">⟳ Tes Ulang</button></div><div class="content-card">${d.providers.map(x=>`<div class="diagrow"><b>${esc(x.name)}</b><span class="${x.ok?'ok':'bad'}">${x.ok?'ONLINE':'ERROR'}</span><div class="diag-note">${esc(x.error||'Provider merespons')}<div class="muted">${Number(x.elapsed_ms||0)} ms</div></div></div>`).join('')}</div><div class="notice">Status diuji dari perangkat ini. ONLINE berarti endpoint merespons pada saat pengecekan, bukan jaminan seluruh endpoint selalu tersedia. Rate limit masing-masing penyedia tetap berlaku.</div>`;}catch(e){showError(e);}}
+ setLoading('MEMBANGUN LIVE NETWORK CONSOLE');try{
+  const d=await api('/api/providers/status',30000);
+  main.innerHTML=`${sectionHead('API Monitor','LIVE NETWORK · HTTP TELEMETRY')}<div class="toolbar"><span class="pill"><span class="live-dot"></span> LIVE SAMPLING</span><span class="pill">${d.providers.filter(x=>x.ok).length}/${d.providers.length} PROVIDER ONLINE</span><button class="action primary" onclick="refreshProviderNodes(this)">⟳ Tes Endpoint</button></div>
+  <div class="telemetry-grid" id="telemetryCards"><div class="telemetry-card"><small>Remote → NOCTURNE</small><strong id="upstreamTotal">—</strong><em id="upstreamRate">—</em></div><div class="telemetry-card"><small>NOCTURNE → WebView</small><strong id="appTxTotal">—</strong><em id="appTxRate">—</em></div><div class="telemetry-card"><small>WebView → NOCTURNE</small><strong id="appRxTotal">—</strong><em id="appRxRate">—</em></div><div class="telemetry-card"><small>HTTP round trip terakhir</small><strong id="lastLatency">—</strong><em id="requestCount">Menunggu sampel</em></div></div>
+  <div class="traffic-panel"><div class="traffic-label"><b>TRANSFER PIPELINE</b><span id="telemetryUptime">MENGUKUR...</span></div><div class="traffic-label"><span>Provider web mengirim data ke backend</span><b id="upstreamRateLabel">0 B/s</b></div><div class="traffic-bar"><span id="upstreamBar"></span></div><div class="traffic-label"><span>Backend mengirim payload ke APK / WebView</span><b id="appTxRateLabel">0 B/s</b></div><div class="traffic-bar"><span id="appTxBar"></span></div><div class="traffic-label"><span>Request body dari WebView</span><b id="appRxRateLabel">0 B/s</b></div><div class="traffic-bar"><span id="appRxBar"></span></div><div class="traffic-legend">Perhitungan berdasarkan byte body HTTP yang benar-benar melewati sesi Requests dan Flask. Bukan penghitung paket TCP, TLS, atau trafik gambar yang dimuat langsung dari host luar oleh WebView.</div></div>
+  ${sectionHead('Provider health','STATUS · HTTP CODE · RTT · PAYLOAD')}<div class="provider-grid" id="providerNodes">${d.providers.map(x=>providerNodeHtml(x)).join('')}</div>
+  ${sectionHead('Recent HTTP activity','LIVE EVENT STREAM')}<div class="content-card" id="httpEvents"><div class="empty">Mengumpulkan aktivitas request...</div></div>
+  <div class="notice">MS = waktu respons request probe. Counter trafik bersifat kumulatif sejak proses NOCTURNE berjalan. Cache dapat membuat pencarian metadata berikutnya tidak mengirim request baru ke provider. MangaBaka dan AniList dipakai untuk katalog/metadata; halaman chapter reader disajikan oleh MangaDex.</div>`;
+  await updateTelemetryPanel();
+  if(window.nocturneTelemetryTimer)clearInterval(window.nocturneTelemetryTimer);
+  window.nocturneTelemetryTimer=setInterval(()=>{if(currentTab==='providers')updateTelemetryPanel().catch(()=>{});},1100);
+ }catch(e){showError(e);}
+}
+function providerNodeHtml(x){const ms=Number(x.elapsed_ms||0);const width=Math.max(4,Math.min(100,100-ms/30));return `<div class="provider-node"><div class="provider-node-head"><strong>${esc(x.name)}</strong><span class="${x.ok?'ok':'bad'}">${x.ok?'ONLINE':'ERROR'}</span></div><div class="provider-metrics"><span>RTT <b>${ms} ms</b></span><span>HTTP <b>${x.status_code??'—'}</b></span><span>RX <b>${formatBytes(x.bytes||0)}</b></span></div><div class="provider-meter"><span style="width:${x.ok?width:0}%"></span></div><div class="muted" style="font-size:10px;margin-top:7px">${esc(x.error||'Probe endpoint selesai')}</div></div>`;}
+async function refreshProviderNodes(button){if(button){button.disabled=true;button.textContent='Menguji...';}try{const d=await api('/api/providers/status',30000);const node=document.getElementById('providerNodes');if(node)node.innerHTML=d.providers.map(x=>providerNodeHtml(x)).join('');}catch(e){console.warn(e);}finally{if(button){button.disabled=false;button.textContent='⟳ Tes Endpoint';}}}
+function formatBytes(n){n=Math.max(0,Number(n)||0);if(n<1024)return Math.round(n)+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';if(n<1073741824)return (n/1048576).toFixed(2)+' MB';return (n/1073741824).toFixed(2)+' GB';}
+function formatRate(n){return formatBytes(n)+'/s';}
+async function updateTelemetryPanel(){const d=await api('/api/telemetry',7000);const put=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value;};put('upstreamTotal',formatBytes(d.upstream_bytes));put('upstreamRate',formatRate(d.upstream_bps)+' · inbound provider');put('appTxTotal',formatBytes(d.app_tx_bytes));put('appTxRate',formatRate(d.app_tx_bps)+' · payload ke WebView');put('appRxTotal',formatBytes(d.app_rx_bytes));put('appRxRate',formatRate(d.app_rx_bps)+' · request dari WebView');put('lastLatency',d.last_upstream_ms==null?'—':Number(d.last_upstream_ms).toFixed(0)+' ms');put('requestCount',`${d.upstream_requests} remote · ${d.app_requests} local`);put('telemetryUptime','UPTIME '+Math.floor(d.uptime_s/60)+'m '+Math.floor(d.uptime_s%60)+'s');put('upstreamRateLabel',formatRate(d.upstream_bps));put('appTxRateLabel',formatRate(d.app_tx_bps));put('appRxRateLabel',formatRate(d.app_rx_bps));const max=Math.max(1024,d.upstream_bps,d.app_tx_bps,d.app_rx_bps);[['upstreamBar',d.upstream_bps],['appTxBar',d.app_tx_bps],['appRxBar',d.app_rx_bps]].forEach(([id,val])=>{const el=document.getElementById(id);if(el)el.style.width=Math.max(1,Math.min(100,Number(val)/max*100))+'%';});const events=document.getElementById('httpEvents');if(events)events.innerHTML=(d.events||[]).slice(0,12).map(x=>`<div class="http-event"><b>${esc(x.host)}</b><span class="${Number(x.status)<400?'ok':'bad'}">${x.status}</span><span>${formatBytes(x.bytes)} · ${x.elapsed_ms??'—'} ms</span></div>`).join('')||'<div class="empty">Belum ada request.</div>';}
 
 async function loadOngoing(page,append){const d=await api(`/api/catalog?section=ongoing&page=${page}`);ongoingPage=page;if(!append)main.innerHTML=`${sectionHead('Anime Ongoing','CURRENTLY AIRING')}<div id="ongoingGrid">${itemGrid(d.items)}</div><div class="toolbar" style="margin-top:18px"><button class="action" onclick="loadOngoing(${Math.max(1,page-1)},false)" ${page<=1?'disabled':''}>← Sebelumnya</button><span class="pill">PAGE ${page}</span><button class="action" onclick="loadOngoing(${page+1},false)">Berikutnya →</button></div>`;else{} }
 async function openGenre(url){rememberCurrent();setLoading('MEMBACA GENRE');try{const d=await api('/api/genre?url='+encodeURIComponent(url));main.innerHTML=`<div class="toolbar"><button class="action" onclick="goBack()">← Kembali</button></div>${sectionHead(d.title,'GENRE INDEX')}${itemGrid(d.items)}`;}catch(e){showError(e);}}
@@ -2159,7 +2762,7 @@ function switchPlayerByIndex(index){const links=currentResolutionGroup().links||
 function switchPlayer(u){currentPlayerUrl=u;const f=document.getElementById('episodeFrame');if(f)f.src=u;const st=document.getElementById('playerState');if(st)st.textContent='Server diganti. Jika embed ditolak, tekan PLAY untuk membuka pemutar sumber.';}
 function openExternalPlayer(){if(currentPlayerUrl)window.open(currentPlayerUrl,'_blank','noopener,noreferrer');}
 function reloadPlayer(){const f=document.getElementById('episodeFrame');if(f){f.src='about:blank';setTimeout(()=>f.src=currentPlayerUrl,120);}}
-function goBack(){const previous=backStack.pop();if(previous){currentTab=previous.tab||'home';main.innerHTML=previous.html;setTabActive(currentTab);statusText.textContent='SHADOW INDEX · '+currentTab.toUpperCase();}else{loadTab('home');}}
+function goBack(){if(window.nocturneReaderObserver){window.nocturneReaderObserver.disconnect();window.nocturneReaderObserver=null;}const previous=backStack.pop();if(previous){currentTab=previous.tab||'home';main.innerHTML=previous.html;setTabActive(currentTab);statusText.textContent='SHADOW INDEX · '+currentTab.toUpperCase();}else{loadTab('home');}}
 async function postApi(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(data)});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Request gagal');return d;}
 async function loadMalTop(){setLoading('MEMUAT PERINGKAT MYANIMELIST');const d=await api('/api/mal/top');main.innerHTML=`${sectionHead('MAL Top Anime','COMMUNITY RANKING')}<div class="notice">Daftar populer/rating dari katalog publik MyAnimeList melalui Tenrai API. Peringkat dan skor dapat berubah.</div><div class="grid">${(d.items||[]).map(x=>`<article class="card" onclick="openMal(${Number(x.mal_id)})"><div class="poster">${x.images?.jpg?.image_url?`<img loading="lazy" src="${esc(x.images.jpg.image_url)}">`:'<div class="noimg">✧</div>'}</div><div class="cardbody"><div class="cardtitle">${esc(x.title)}</div><div class="cardsub">★ ${esc(x.score??'—')} · #${esc(x.rank??'—')}</div></div></article>`).join('')}</div>`;}
 async function loadSeasonNow(){setLoading('MEMUAT ANIME MUSIM INI');const d=await api('/api/mal/seasons/now');main.innerHTML=`${sectionHead('Anime Musim Ini','CURRENT SEASON · MAL')}<div class="grid">${(d.items||[]).map(x=>`<article class="card" onclick="openMal(${Number(x.mal_id)})"><div class="poster">${x.images?.jpg?.image_url?`<img loading="lazy" src="${esc(x.images.jpg.image_url)}">`:'<div class="noimg">✧</div>'}</div><div class="cardbody"><div class="cardtitle">${esc(x.title)}</div><div class="cardsub">${esc(x.type||'Anime')} · ★ ${esc(x.score??'—')}</div></div></article>`).join('')}</div>`;}

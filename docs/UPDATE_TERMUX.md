@@ -1,4 +1,4 @@
-# Update NOCTURNE 4.3.0 from Termux
+# Update NOCTURNE 4.4.0 from Termux
 
 ZIP source ini tidak menyertakan `.git`; riwayat, branch, dan kredensial Git lokal tetap utuh.
 
@@ -11,7 +11,7 @@ termux-setup-storage
 mkdir -p ~/projects
 ```
 
-Simpan `NOCTURNE-Streaming-Android-4.3.0.zip` ke folder Download Android.
+Simpan `NOCTURNE-Streaming-Android-4.4.0.zip` ke folder Download Android.
 
 ## 2. Perbarui checkout yang sudah ada
 
@@ -26,7 +26,7 @@ Lalu overlay file baru ke checkout (gunakan folder induk repo, bukan folder repo
 ```bash
 cd ~/projects/NOCTURNE-Streaming-Android
 git pull --rebase origin main
-unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.3.0.zip -d ~/projects
+unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.4.0.zip -d ~/projects
 git status
 ```
 
@@ -37,7 +37,7 @@ Jika checkout berada di folder lain, ganti `~/projects` pada perintah unzip deng
 ```bash
 cd ~/projects/NOCTURNE-Streaming-Android
 git add -A
-git commit -m "NOCTURNE 4.3: vertical anime list and wallpaper preview"
+git commit -m "NOCTURNE 4.4: manga reader and live network monitor"
 git push origin main
 ```
 
@@ -45,7 +45,7 @@ Jangan menaruh Personal Access Token langsung di perintah atau file source.
 
 ## 4. Build APK
 
-Setelah push, buka GitHub → **Actions** → **Build NOCTURNE Android APK**. Pilih run paling baru yang berhasil dan unduh artifact **`NOCTURNE-4.3-debug-APK`**. Extract artifact ZIP untuk memperoleh `app-debug.apk`.
+Setelah push, buka GitHub → **Actions** → **Build NOCTURNE Android APK**. Pilih run paling baru yang berhasil dan unduh artifact **`NOCTURNE-4.4-debug-APK`**. Extract artifact ZIP untuk memperoleh `app-debug.apk`.
 
 Build lokal memerlukan JDK 17, Android SDK Platform 36, Gradle 8.13, dan Python 3.11:
 

@@ -1,4 +1,4 @@
-# Upload NOCTURNE 4.3 to GitHub from Termux
+# Upload NOCTURNE 4.4 to GitHub from Termux
 
 ## 1. Create an empty GitHub repository
 
@@ -6,13 +6,13 @@ On GitHub, create a repository (for example `NOCTURNE-Streaming-Android`). Do no
 
 ## 2. Extract and initialize the project in Termux
 
-Download `NOCTURNE-Streaming-Android-4.3.0.zip` to the Android `Download` folder first. Then run:
+Download `NOCTURNE-Streaming-Android-4.4.0.zip` to the Android `Download` folder first. Then run:
 
 ```bash
 pkg update -y && pkg install -y git unzip
 termux-setup-storage
 mkdir -p ~/projects
-unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.3.0.zip -d ~/projects
+unzip -o /sdcard/Download/NOCTURNE-Streaming-Android-4.4.0.zip -d ~/projects
 cd ~/projects/NOCTURNE-Streaming-Android
 
 # Set these to your GitHub account details
@@ -21,7 +21,7 @@ git config --global user.email "YOUR_GITHUB_EMAIL"
 
 git init -b main
 git add .
-git commit -m "NOCTURNE 4.3 Android project"
+git commit -m "NOCTURNE 4.4 Android project"
 
 # Replace the URL with your own empty GitHub repository URL
 git remote add origin https://github.com/YOUR_GITHUB_USERNAME/NOCTURNE-Streaming-Android.git
@@ -36,7 +36,7 @@ When Git asks for credentials, enter your GitHub username. For the password prom
 
 ## 4. Download the APK from GitHub Actions
 
-After the push succeeds, open the repository on GitHub → **Actions** → **Build NOCTURNE Android APK**. Open the latest successful run and download the artifact named `NOCTURNE-4.3-debug-APK` from the **Artifacts** section. Extract that artifact ZIP to get `app-debug.apk`. You can also start a build manually from **Actions → Build NOCTURNE Android APK → Run workflow**.
+After the push succeeds, open the repository on GitHub → **Actions** → **Build NOCTURNE Android APK**. Open the latest successful run and download the artifact named `NOCTURNE-4.4-debug-APK` from the **Artifacts** section. Extract that artifact ZIP to get `app-debug.apk`. You can also start a build manually from **Actions → Build NOCTURNE Android APK → Run workflow**.
 
 ## 5. Push later changes
 

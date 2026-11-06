@@ -55,6 +55,9 @@ jobs:
       - name: Check feature integration helpers
         run: python docs/test_feature_integrations.py
 
+      - name: Check manga integrations
+        run: python docs/test_manga_integrations.py
+
       - name: Check inline JavaScript
         run: python docs/check_inline_js.py
 
@@ -78,7 +81,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: NOCTURNE-4.3-debug-APK
+          name: NOCTURNE-4.4-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
